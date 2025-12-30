@@ -22,3 +22,4 @@ The CS2SimpleVote.json config is auto-created on first launch, and is laid out a
   "enable_nominate": true, //Enable Nominate
   "ConfigVersion": 1
 }
+
