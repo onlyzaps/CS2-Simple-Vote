@@ -484,7 +484,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         if (isRtv)
         {
-            Server.PrintToChatAll($" \x01Changing map in {Config.RtvDelaySeconds} seconds...");
+            Server.PrintToChatAll($" \x01 Changing map in {Config.RtvDelaySeconds} seconds...");
             AddTimer(Config.RtvDelaySeconds, () => Server.ExecuteCommand($"host_workshop_map {winningMapId}"));
         }
         else
@@ -536,7 +536,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // This triggers when the match actually ends (Scoreboard)
         if (!string.IsNullOrEmpty(_pendingMapId))
         {
-            Server.PrintToChatAll($" \x01Changing map to \x04{GetMapName(_pendingMapId)}\x01 in 8 seconds...");
+            Server.PrintToChatAll($" \x01 Changing map to \x04{GetMapName(_pendingMapId)}\x01 in 8 seconds...");
             // Slight delay to let players see the scoreboard, then force change
             AddTimer(8.0f, () => Server.ExecuteCommand($"host_workshop_map {_pendingMapId}"));
         }
