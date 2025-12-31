@@ -1,10 +1,15 @@
 CS2 Simple Vote provides all of the basic map voting functionality at a fraction of the resources.
+
 NOTE:DO NOT UNLOAD THIS PLUGIN AND RELOAD IT ON-THE-FLY. IT WILL GENERATE DUPLICATE INSTANCES.
 
 Commands are:
+
 rtv - to RockTheVote prior to a map vote. Cannot be initiated during warmup or after a map vote.
+
 nominate - to nominate a map to be included in the standard map vote.
+
 nextmap - to display the next map following a map vote.
+
 revote - to revote within the standard map vote window.
 
 The CS2SimpleVote.json config is auto-created on first launch, and is laid out as follows:
