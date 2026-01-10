@@ -1,4 +1,5 @@
 CS2 Simple Vote provides all of the basic map voting functionality at a fraction of the resources.
+All other mapvotes had memory leaks or bugs that would break the game after a certain amount of time.
 
 NOTE:DO NOT UNLOAD THIS PLUGIN AND RELOAD IT ON-THE-FLY. IT WILL GENERATE DUPLICATE INSTANCES.
 
