@@ -45,7 +45,7 @@ public class MapItem
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.3.2";
+    public override string ModuleVersion => "1.1.0";
 
     public VoteConfig Config { get; set; } = new();
 
