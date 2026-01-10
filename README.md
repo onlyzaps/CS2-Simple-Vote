@@ -8,7 +8,7 @@ Commands are:
 
 rtv - to RockTheVote prior to a map vote. Cannot be initiated during warmup or after a map vote.
 
-nominate - to nominate a map to be included in the standard map vote.
+nominate - to nominate a map to be included in the standard map vote. (Uses a list. specifying map coming soon)
 
 nextmap - to display the next map following a map vote.
 
