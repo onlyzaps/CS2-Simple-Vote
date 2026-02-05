@@ -1,4 +1,4 @@
-# CS2SimpleVote
+# CS2 Simple Vote
 
 A lightweight, robust, and feature-rich map voting plugin for Counter-Strike 2, built on the **CounterStrikeSharp** framework. It provides a seamless experience for players to nominate and vote for the next map from a Steam Workshop collection, with powerful administrative controls.
 
@@ -90,3 +90,4 @@ To grant admin access, add your SteamID64 (decimal format, starts with 7) to the
 2.  Place the `CS2SimpleVote.dll` in the `game/csgo/addons/counterstrikesharp/plugins/CS2SimpleVote/` folder.
 3.  Configure your `steam_api_key`, `collection_id`, and `admins` in the generated config file.
 4.  Restart your server or load the plugin.
+
