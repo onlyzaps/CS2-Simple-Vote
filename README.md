@@ -1,4 +1,4 @@
-# CS2 Simple Vote
+# CS2SimpleVote
 
 A lightweight, robust, and feature-rich map voting plugin for Counter-Strike 2, built on the **CounterStrikeSharp** framework. It provides a seamless experience for players to nominate and vote for the next map from a Steam Workshop collection, with powerful administrative controls.
 
@@ -61,26 +61,93 @@ To grant admin access, add your SteamID64 (decimal format, starts with 7) to the
 ## ⌨️ Player Commands
 *Commands can be used with or without the `!` prefix.*
 
-*   `!help` / `help`: Lists all available commands in chat.
-*   `!rtv` / `rtv`: Add your vote to change the current map.
-*   `!nominate` / `nominate`: Open the menu to nominate a map.
-*   `!nominate [name]`: Search and nominate a map. If only one map matches, it is auto-nominated.
-*   `!revote` / `revote`: Re-open the current vote menu if you want to change your mind.
-*   `!nextmap` / `nextmap`: Displays the result of the vote once it has finished.
+### `!help`
+Lists all available commands in chat.
+```text
+--- CS2SimpleVote Commands ---
+!help - List available commands
+!nextmap - Show next map
+!nominate - Nominate a map (Usage: nominate [name])
+!nominatelist - List nominated maps
+!revote - Recast vote
+!rtv - Rock the Vote
+```
+
+### `!rtv`
+Add your vote to change the current map.
+```text
+PlayerName wants to change the map! (1/5)
+```
+
+### `!nominate`
+Open the menu to nominate a map from the collection.
+```text
+Page 1/2. Type number to select (or 'cancel'):
+[1] de_dust2
+[2] de_mirage
+[3] cs_office
+[4] de_nuke
+[5] de_inferno
+[6] de_vertigo
+[0] Next Page
+```
+
+### `!nominate [name]`
+Search and nominate a map. If only one map matches, it is auto-nominated.
+```text
+PlayerName nominated de_dust2.
+```
+
+### `!nominatelist`
+Shows the Maps currently nominated for the next vote and who nominated them.
+```text
+--- Nominated Maps (2/8) ---
+ - PlayerOne - de_dust2
+ - PlayerTwo - de_mirage
+```
+
+### `!revote`
+Re-open the current vote options menu if you want to change your vote.
+```text
+Redisplaying vote options. You may recast your vote.
+Type the number to vote:
+[1] de_dust2
+[2] de_mirage
+```
+
+### `!nextmap`
+Displays the result of the voting process once it has finished.
+```text
+The next map will be: de_dust2
+```
 
 ---
 
 ## 🛡️ Admin Commands
 *Requires your SteamID to be in the `admins` configuration list.*
 
-*   `!forcemap [name]`: 
-    *   Forcefully changes the map immediately.
-    *   Works like nominate: matches partial names and opens a menu if multiple matches found.
-    *   If one match is found, changes map immediately.
-*   `!forcevote`:
-    *   **If no vote has occurred**: Starts a standard map vote. The vote remains open for the number of rounds configured in `vote_open_for_rounds`.
-    *   **If a vote has already finished**: Triggers a 30-second "Revote" with a countdown timer. If no one votes, the original winner is kept.
-    *   *Note: Cannot be used during Warmup or after the Match has ended.*
+### `!forcemap [name]`
+Forcefully changes the map immediately. Use with a search term to find a map.
+*   **One match**: Changes map immediately.
+*   **Multiple matches**: Opens a selection menu.
+```text
+Admin AdminName forced map change to de_dust2.
+```
+
+### `!forcevote`
+Manually starts the map vote process.
+*   **If no vote has occurred**: Starts a standard map vote.
+*   **If a vote has already finished**: Triggers a 30-second "Revote".
+```text
+Admin AdminName initiated a map vote.
+--- Vote for the Next Map! ---
+Vote will remain open until the round ends.
+Type the number to vote:
+[1] de_dust2
+[2] de_mirage
+[3] cs_office
+...
+```
 
 ---
 
@@ -90,4 +157,3 @@ To grant admin access, add your SteamID64 (decimal format, starts with 7) to the
 2.  Place the `CS2SimpleVote.dll` in the `game/csgo/addons/counterstrikesharp/plugins/CS2SimpleVote/` folder.
 3.  Configure your `steam_api_key`, `collection_id`, and `admins` in the generated config file.
 4.  Restart your server or load the plugin.
-
