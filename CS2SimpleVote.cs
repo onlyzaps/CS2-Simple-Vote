@@ -94,6 +94,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private string _historyFilePath = "";
     private string _cacheFilePath = "";
 
+    // Cancellation for background task
+    private CancellationTokenSource _cts = new();
+
+    // Flag to prevent execution after unload
+    private bool _unloaded = false;
+
     public void OnConfigParsed(VoteConfig config)
     {
         Config = config;
@@ -127,16 +133,63 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         LoadMapCache();
 
         // 3. Start Background Update
-        Task.Run(FetchCollectionMaps);
+        Task.Run(() => FetchCollectionMaps(_cts.Token));
 
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventRoundEnd>(OnRoundEnd);
         RegisterEventHandler<EventCsWinPanelMatch>(OnMatchEnd);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
+
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
 
-        AddCommandListener("say", OnPlayerChat);
-        AddCommandListener("say_team", OnPlayerChat);
+        AddCommandListener("say", OnPlayerChat, HookMode.Post);
+        AddCommandListener("say_team", OnPlayerChat, HookMode.Post);
+    }
+
+    public override void Unload(bool hotReload)
+    {
+        _unloaded = true;
+
+        // Kill all timers first to prevent any further execution
+        _reminderTimer?.Kill();
+        _reminderTimer = null;
+        _mapInfoTimer?.Kill();
+        _mapInfoTimer = null;
+        _centerMessageTimer?.Kill();
+        _centerMessageTimer = null;
+
+        // Clear collections to release references
+        _availableMaps.Clear();
+        _recentMapIds.Clear();
+        _rtvVoters.Clear();
+        _activeVoteOptions.Clear();
+        _playerVotes.Clear();
+        _nominatedMaps.Clear();
+        _hasNominatedSteamIds.Clear();
+        _nominationOwner.Clear();
+        _nominationNames.Clear();
+        _nominatingPlayers.Clear();
+        _playerNominationPage.Clear();
+        _forcemapPlayers.Clear();
+        _playerForcemapPage.Clear();
+
+        // Remove listeners and handlers
+        DeregisterEventHandler<EventRoundStart>(OnRoundStart);
+        DeregisterEventHandler<EventRoundEnd>(OnRoundEnd);
+        DeregisterEventHandler<EventCsWinPanelMatch>(OnMatchEnd);
+        DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
+
+        RemoveListener<Listeners.OnMapStart>(OnMapStart);
+
+        RemoveCommandListener("say", OnPlayerChat, HookMode.Post);
+        RemoveCommandListener("say_team", OnPlayerChat, HookMode.Post);
+
+        // Cancel background task
+        _cts.Cancel();
+        _cts.Dispose();
+
+        // Dispose managed resources
+        _httpClient.Dispose();
     }
 
     private void OnMapStart(string mapName)
@@ -153,6 +206,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             _mapInfoTimer = AddTimer(Config.CurrentMapMessageInterval, () =>
             {
+                if (_unloaded) return;
                 // Find full title from available maps
                 string displayMapName = _availableMaps.FirstOrDefault(m => mapName.Contains(m.Name) || m.Id == mapName || mapName.Contains(m.Id))?.Name ?? mapName;
                 Server.PrintToChatAll($" {ColorDefault}You're playing {ColorGreen}{displayMapName}{ColorDefault} on {ColorGreen}{Config.ServerName}{ColorDefault}!");
@@ -180,9 +234,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _nominatedMaps.Clear();
         _hasNominatedSteamIds.Clear();
         _nominationOwner.Clear();
+        _nominationNames.Clear();
         _nominatingPlayers.Clear();
         _playerNominationPage.Clear();
-        _nominationNames.Clear();
         _forcemapPlayers.Clear();
         _playerForcemapPage.Clear();
 
@@ -254,7 +308,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     // --- Steam API ---
 
-    private async Task FetchCollectionMaps()
+    private async Task FetchCollectionMaps(CancellationToken token = default)
     {
         if (string.IsNullOrEmpty(Config.SteamApiKey) || string.IsNullOrEmpty(Config.CollectionId)) return;
 
@@ -265,8 +319,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 new KeyValuePair<string, string>("publishedfileids[0]", Config.CollectionId)
             });
 
-            var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", collContent);
-            using var collDoc = JsonDocument.Parse(await collRes.Content.ReadAsStringAsync());
+            var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", collContent, token);
+            using var collDoc = JsonDocument.Parse(await collRes.Content.ReadAsStringAsync(token));
 
             var children = collDoc.RootElement.GetProperty("response").GetProperty("collectiondetails")[0].GetProperty("children");
             var fileIds = children.EnumerateArray().Select(c => c.GetProperty("publishedfileid").GetString()!).ToList();
@@ -274,8 +328,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             var itemPairs = new List<KeyValuePair<string, string>> { new("itemcount", fileIds.Count.ToString()) };
             for (int i = 0; i < fileIds.Count; i++) itemPairs.Add(new($"publishedfileids[{i}]", fileIds[i]));
 
-            var itemRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/", new FormUrlEncodedContent(itemPairs));
-            using var itemDoc = JsonDocument.Parse(await itemRes.Content.ReadAsStringAsync());
+            var itemRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/", new FormUrlEncodedContent(itemPairs), token);
+            using var itemDoc = JsonDocument.Parse(await itemRes.Content.ReadAsStringAsync(token));
 
             var newMapList = new List<MapItem>();
             foreach (var item in itemDoc.RootElement.GetProperty("response").GetProperty("publishedfiledetails").EnumerateArray())
@@ -290,6 +344,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             _availableMaps = newMapList;
             Console.WriteLine($"[CS2SimpleVote] Updated {_availableMaps.Count} maps from Steam.");
             SaveMapCache();
+        }
+        catch (OperationCanceledException)
+        {
+            // Task was cancelled, ignore
         }
         catch (Exception ex)
         {
@@ -337,6 +395,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult OnPlayerChat(CCSPlayerController? player, CommandInfo info)
     {
+        if (_unloaded) return HookResult.Continue;
         if (!IsValidPlayer(player)) return HookResult.Continue;
         var p = player!;
         string msg = info.GetArg(1).Trim();
@@ -732,11 +791,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (Config.EnableReminders)
         {
             _reminderTimer = AddTimer(Config.ReminderIntervalSeconds, () => {
+                if (_unloaded) return;
                 foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) { p.PrintToChat($" {ColorDefault}Reminder: Please vote for the next map!"); PrintVoteOptionsToPlayer(p); }
             }, TimerFlags.REPEAT);
         }
 
         _centerMessageTimer = AddTimer(1.0f, () => {
+            if (_unloaded) return;
             if (_isForceVote && _previousWinningMapId != null)
             {
                 _forceVoteTimeRemaining--;
@@ -877,5 +938,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!string.IsNullOrEmpty(_pendingMapId)) { Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{GetMapName(_pendingMapId)}{ColorDefault}!"); AddTimer(8.0f, () => Server.ExecuteCommand($"host_workshop_map {_pendingMapId}")); }
         return HookResult.Continue;
     }
-    private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info) { if (@event.Userid is { } player) { _rtvVoters.Remove(player.Slot); _playerVotes.Remove(player.Slot); CloseNominationMenu(player); } return HookResult.Continue; }
+    private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
+    {
+        if (@event.Userid is { } player) { _rtvVoters.Remove(player.Slot); _playerVotes.Remove(player.Slot); CloseNominationMenu(player); } return HookResult.Continue; }
 }
