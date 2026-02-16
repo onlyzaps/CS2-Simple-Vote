@@ -38,14 +38,22 @@ jobs:
           cp publish/CS2SimpleVote.dll release/addons/counterstrikesharp/plugins/CS2SimpleVote/
           cp publish/CS2SimpleVote.pdb release/addons/counterstrikesharp/plugins/CS2SimpleVote/
           cp publish/CS2SimpleVote.deps.json release/addons/counterstrikesharp/plugins/CS2SimpleVote/
-          cd release
-          zip -r ../CS2SimpleVote-${{ github.ref_name || 'pr-build' }}.zip .
+      
+      - name: Create zip file
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ZIP_NAME="CS2SimpleVote-${{ github.ref_name }}.zip"
+          else
+            ZIP_NAME="CS2SimpleVote-build-${{ github.sha }}.zip"
+          fi
+          cd release && zip -r "../${ZIP_NAME}" . && cd ..
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
       
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: CS2SimpleVote-build
-          path: CS2SimpleVote-${{ github.ref_name || 'pr-build' }}.zip
+          path: ${{ env.ZIP_NAME }}
           retention-days: 7
   
   release:
@@ -65,7 +73,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            CS2SimpleVote-${{ github.ref_name }}.zip
+            CS2SimpleVote-*.zip
           body: |
             ## CS2SimpleVote ${{ github.ref_name }}
             
