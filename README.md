@@ -157,3 +157,4 @@ Type the number to vote:
 2.  Place the `CS2SimpleVote.dll` in the `game/csgo/addons/counterstrikesharp/plugins/CS2SimpleVote/` folder.
 3.  Configure your `steam_api_key`, `collection_id`, and `admins` in the generated config file.
 4.  Restart your server or load the plugin.
+
