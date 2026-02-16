@@ -1,0 +1,95 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      
+      - name: Restore dependencies
+        run: dotnet restore CS2SimpleVote.csproj
+      
+      - name: Build project
+        run: dotnet build CS2SimpleVote.csproj --configuration Release --no-restore
+      
+      - name: Publish project
+        run: dotnet publish CS2SimpleVote.csproj --configuration Release --no-build --output ./publish
+      
+      - name: Create release package
+        run: |
+          mkdir -p release/addons/counterstrikesharp/plugins/CS2SimpleVote
+          cp publish/CS2SimpleVote.dll release/addons/counterstrikesharp/plugins/CS2SimpleVote/
+          cp publish/CS2SimpleVote.pdb release/addons/counterstrikesharp/plugins/CS2SimpleVote/
+          cp publish/CS2SimpleVote.deps.json release/addons/counterstrikesharp/plugins/CS2SimpleVote/
+          cd release
+          zip -r ../CS2SimpleVote-${{ github.ref_name || 'pr-build' }}.zip .
+      
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CS2SimpleVote-build
+          path: CS2SimpleVote-${{ github.ref_name || 'pr-build' }}.zip
+          retention-days: 7
+  
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CS2SimpleVote-build
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            CS2SimpleVote-${{ github.ref_name }}.zip
+          body: |
+            ## CS2SimpleVote ${{ github.ref_name }}
+            
+            ### Installation
+            1. Download `CS2SimpleVote-${{ github.ref_name }}.zip`
+            2. Extract the contents to your Counter-Strike 2 server directory
+            3. The plugin will be installed at `addons/counterstrikesharp/plugins/CS2SimpleVote/`
+            4. Configure the plugin in `configs/plugins/CS2SimpleVote/CS2SimpleVote.json`
+            5. Restart your server
+            
+            ### Requirements
+            - CounterStrikeSharp framework (v1.0.362 or later) installed on your server
+            - .NET 8.0 Runtime
+            - Steam Web API key for Workshop collection fetching
+            
+            ### Features
+            - Automated map voting at specific rounds
+            - Rock The Vote (RTV) system
+            - Map nomination with search support
+            - Recent map history filtering
+            - Workshop collection integration
+            - Interactive HUD alerts
+            - Admin controls
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
