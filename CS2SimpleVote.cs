@@ -324,10 +324,29 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             });
 
             var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", collContent, token);
-            using var collDoc = JsonDocument.Parse(await collRes.Content.ReadAsStringAsync(token));
+            string collJson = await collRes.Content.ReadAsStringAsync(token);
+            using var collDoc = JsonDocument.Parse(collJson);
 
-            var children = collDoc.RootElement.GetProperty("response").GetProperty("collectiondetails")[0].GetProperty("children");
-            var fileIds = children.EnumerateArray().Select(c => c.GetProperty("publishedfileid").GetString()!).ToList();
+            var rootResp = collDoc.RootElement.GetProperty("response");
+            if (!rootResp.TryGetProperty("collectiondetails", out var collDetails) || collDetails.GetArrayLength() == 0)
+            {
+                throw new Exception("Invalid response or missing collection details from Steam API. Check Collection ID.");
+            }
+
+            var firstColl = collDetails[0];
+            if (!firstColl.TryGetProperty("children", out var children))
+            {
+                int resultObj = firstColl.TryGetProperty("result", out var resToken) ? resToken.GetInt32() : -1;
+                throw new Exception($"Collection has no children or is inaccessible. Steam result code: {resultObj}. Check if the Steam API Key is valid and collection is public.");
+            }
+
+            var fileIds = children.EnumerateArray()
+                .Select(c => c.GetProperty("publishedfileid").GetString())
+                .Where(id => !string.IsNullOrEmpty(id))
+                .Cast<string>()
+                .ToList();
+
+            if (fileIds.Count == 0) throw new Exception("No files found in collection.");
 
             var itemPairs = new List<KeyValuePair<string, string>> { 
                 new("key", Config.SteamApiKey),
@@ -336,16 +355,24 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             for (int i = 0; i < fileIds.Count; i++) itemPairs.Add(new($"publishedfileids[{i}]", fileIds[i]));
 
             var itemRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/", new FormUrlEncodedContent(itemPairs), token);
-            using var itemDoc = JsonDocument.Parse(await itemRes.Content.ReadAsStringAsync(token));
+            string itemJson = await itemRes.Content.ReadAsStringAsync(token);
+            using var itemDoc = JsonDocument.Parse(itemJson);
 
             var newMapList = new List<MapItem>();
-            foreach (var item in itemDoc.RootElement.GetProperty("response").GetProperty("publishedfiledetails").EnumerateArray())
+            if (itemDoc.RootElement.TryGetProperty("response", out var itemResp) && itemResp.TryGetProperty("publishedfiledetails", out var pubDetails))
             {
-                newMapList.Add(new MapItem
+                foreach (var item in pubDetails.EnumerateArray())
                 {
-                    Id = item.GetProperty("publishedfileid").GetString()!,
-                    Name = item.GetProperty("title").GetString()!
-                });
+                    if (item.TryGetProperty("title", out var titleProp) && item.TryGetProperty("publishedfileid", out var idProp))
+                    {
+                        string? mapName = titleProp.GetString();
+                        string? mapId = idProp.GetString();
+                        if (!string.IsNullOrEmpty(mapName) && !string.IsNullOrEmpty(mapId))
+                        {
+                            newMapList.Add(new MapItem { Id = mapId, Name = mapName });
+                        }
+                    }
+                }
             }
 
             _availableMaps = newMapList;
