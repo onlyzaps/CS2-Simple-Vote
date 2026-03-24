@@ -7,7 +7,6 @@ using CounterStrikeSharp.API.Modules.Menu;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using System.Collections.Concurrent;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -168,9 +167,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         LogRoutine(new { hotReload }, null);
         _unloaded = true;
-        _logQueue.CompleteAdding();
 
-        // Kill all timers first to prevent any further execution
+        // 1. Cancel background tasks (FetchCollectionMaps) first
+        _cts.Cancel();
+
+        // 2. Kill all timers to prevent any further callbacks
         _reminderTimer?.Kill();
         _reminderTimer = null;
         _mapInfoTimer?.Kill();
@@ -178,7 +179,17 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _centerMessageTimer?.Kill();
         _centerMessageTimer = null;
 
-        // Clear collections to release references
+        // 3. Complete the log queue so the log writer can drain and exit
+        try { _logQueue.CompleteAdding(); } catch (ObjectDisposedException) { }
+
+        // 4. Wait for the log writer task to finish (with timeout to avoid hanging)
+        if (_logTask != null)
+        {
+            try { _logTask.Wait(TimeSpan.FromSeconds(3)); } catch { /* timeout or cancelled, proceed */ }
+            _logTask = null;
+        }
+
+        // 5. Clear collections to release references
         _availableMaps.Clear();
         _recentMapIds.Clear();
         _rtvVoters.Clear();
@@ -195,7 +206,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _setnextmapPlayers.Clear();
         _playerSetNextMapPage.Clear();
 
-        // Remove listeners and handlers
+        // 6. Remove listeners and handlers
         DeregisterEventHandler<EventRoundStart>(OnRoundStart);
         DeregisterEventHandler<EventRoundEnd>(OnRoundEnd);
         DeregisterEventHandler<EventCsWinPanelMatch>(OnMatchEnd);
@@ -206,11 +217,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         RemoveCommandListener("say", OnPlayerChat, HookMode.Post);
         RemoveCommandListener("say_team", OnPlayerChat, HookMode.Post);
 
-        // Cancel background task
-        _cts.Cancel();
+        // 7. Dispose managed resources
         _cts.Dispose();
-
-        // Dispose managed resources
+        _logQueue.Dispose();
         _httpClient.Dispose();
     }
 
@@ -430,68 +439,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private bool IsCurrentMap(MapItem map) => Server.MapName.Contains(map.Id, StringComparison.OrdinalIgnoreCase) || Server.MapName.Equals(map.Name, StringComparison.OrdinalIgnoreCase);
     private IEnumerable<CCSPlayerController> GetHumanPlayers() => Utilities.GetPlayers().Where(IsValidPlayer);
 
-    // --- Command Handlers ---
-    [ConsoleCommand("rtv", "Rock the Vote")]
-    public void OnRtvCommand(CCSPlayerController? player, CommandInfo command) => AttemptRtv(player);
-
-    [ConsoleCommand("nominate", "Nominate a map (Usage: nominate [name])")]
-    public void OnNominateCommand(CCSPlayerController? player, CommandInfo command)
-    {
-        LogRoutine(new { player, command }, null);
-        string? searchTerm = command.ArgCount > 1 ? command.GetArg(1) : null;
-        AttemptNominate(player, searchTerm);
-    }
-
-    [ConsoleCommand("nominatelist", "List nominated maps")]
-    public void OnNominateListCommand(CCSPlayerController? player, CommandInfo command) => PrintNominationList(player);
-
-    [ConsoleCommand("revote", "Recast vote")]
-    public void OnRevoteCommand(CCSPlayerController? player, CommandInfo command) => AttemptRevote(player);
-
-    [ConsoleCommand("nextmap", "Show next map")]
-    public void OnNextMapCommand(CCSPlayerController? player, CommandInfo command) => PrintNextMap(player);
-
-    [ConsoleCommand("lastmap", "Show last played map")]
-    public void OnLastMapCommand(CCSPlayerController? player, CommandInfo command) => PrintLastMap(player);
-
-    [ConsoleCommand("recentmaps", "Show recently played maps")]
-    public void OnRecentMapsCommand(CCSPlayerController? player, CommandInfo command)
-    {
-        LogRoutine(new { player, command }, null);
-        string? arg = command.ArgCount > 1 ? command.GetArg(1) : null;
-        PrintRecentMaps(player, arg);
-    }
-
-    [ConsoleCommand("forcemap", "Force change map (Admin only) (Usage: forcemap [name])")]
-    public void OnForcemapCommand(CCSPlayerController? player, CommandInfo command)
-    {
-        LogRoutine(new { player, command }, null);
-        string? searchTerm = command.ArgCount > 1 ? command.GetArg(1) : null;
-        AttemptForcemap(player, searchTerm);
-    }
-
-    [ConsoleCommand("setnextmap", "Set the next map directly (Admin only) (Usage: setnextmap [name])")]
-    public void OnSetNextMapCommand(CCSPlayerController? player, CommandInfo command)
-    {
-        LogRoutine(new { player, command }, null);
-        string? searchTerm = command.ArgCount > 1 ? command.GetArg(1) : null;
-        AttemptSetNextMap(player, searchTerm);
-    }
-
-    [ConsoleCommand("forcevote", "Force start map vote (Admin only)")]
-    public void OnForceVoteCommand(CCSPlayerController? player, CommandInfo command) => AttemptForceVote(player);
-
-    [ConsoleCommand("finishvote", "End an active vote early (Admin only)")]
-    public void OnFinishVoteCommand(CCSPlayerController? player, CommandInfo command) => AttemptFinishVote(player);
-
-    [ConsoleCommand("endwarmup", "End the current warmup (Admin only)")]
-    public void OnEndWarmupCommand(CCSPlayerController? player, CommandInfo command) => AttemptEndWarmup(player);
-
-    [ConsoleCommand("help", "List available commands")]
-    public void OnHelpCommand(CCSPlayerController? player, CommandInfo command) => PrintHelp(player);
-
-    [ConsoleCommand("votedebug", "Show debug info (Admin only)")]
-    public void OnVoteDebugCommand(CCSPlayerController? player, CommandInfo command) => AttemptVoteDebug(player);
+    // --- Command Handlers (all handled via OnPlayerChat listener) ---
 
     private HookResult OnPlayerChat(CCSPlayerController? player, CommandInfo info)
     {
@@ -660,21 +608,26 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         var p = player!;
         bool isAdmin = Config.Admins.Contains(p.SteamID);
 
-        var commands = this.GetType().GetMethods()
-            .Select(m => m.GetCustomAttribute<ConsoleCommandAttribute>())
-            .Where(a => a != null)
-            .ToList();
-
         p.PrintToChat($" {ColorDefault}---{ColorGreen} CS2SimpleVote Commands {ColorDefault}---");
 
         if (isAdmin)
         {
-            var adminCmds = commands.Where(c => c!.Description.Contains("Admin", StringComparison.OrdinalIgnoreCase)).OrderBy(c => c!.Command);
-            foreach (var cmd in adminCmds) p.PrintToChat($" {ColorGreen}!{cmd!.Command} {ColorDefault}- {cmd.Description}");
+            p.PrintToChat($" {ColorGreen}!endwarmup {ColorDefault}- End the current warmup (Admin only)");
+            p.PrintToChat($" {ColorGreen}!finishvote {ColorDefault}- End an active vote early (Admin only)");
+            p.PrintToChat($" {ColorGreen}!forcemap [name] {ColorDefault}- Force change map (Admin only)");
+            p.PrintToChat($" {ColorGreen}!forcevote {ColorDefault}- Force start map vote (Admin only)");
+            p.PrintToChat($" {ColorGreen}!setnextmap [name] {ColorDefault}- Set the next map directly (Admin only)");
+            p.PrintToChat($" {ColorGreen}!votedebug {ColorDefault}- Show debug info (Admin only)");
         }
 
-        var playerCmds = commands.Where(c => !c!.Description.Contains("Admin", StringComparison.OrdinalIgnoreCase)).OrderBy(c => c!.Command);
-        foreach (var cmd in playerCmds) p.PrintToChat($" {ColorGreen}!{cmd!.Command} {ColorDefault}- {cmd.Description}");
+        p.PrintToChat($" {ColorGreen}!help {ColorDefault}- List available commands");
+        p.PrintToChat($" {ColorGreen}!lastmap {ColorDefault}- Show last played map");
+        p.PrintToChat($" {ColorGreen}!nextmap {ColorDefault}- Show next map");
+        p.PrintToChat($" {ColorGreen}!nominate [name] {ColorDefault}- Nominate a map");
+        p.PrintToChat($" {ColorGreen}!nominatelist {ColorDefault}- List nominated maps");
+        p.PrintToChat($" {ColorGreen}!recentmaps {ColorDefault}- Show recently played maps");
+        p.PrintToChat($" {ColorGreen}!revote {ColorDefault}- Recast vote");
+        p.PrintToChat($" {ColorGreen}!rtv {ColorDefault}- Rock the Vote");
     }
 
     private void PrintNominationList(CCSPlayerController? player)
