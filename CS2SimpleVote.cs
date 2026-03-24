@@ -74,6 +74,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private string? _previousWinningMapId;
     private string? _previousWinningMapName;
     private bool _matchEnded;
+    private bool _nextMapSetByAdmin;
     private int _forceVoteTimeRemaining;
     private string? _nextMapName;
     private string? _pendingMapId;
@@ -240,6 +241,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         LogRoutine(new { }, null);
         _matchEnded = false;
+        _nextMapSetByAdmin = false;
         _voteInProgress = false;
         _voteFinished = false;
         _isScheduledVote = false;
@@ -479,6 +481,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     [ConsoleCommand("forcevote", "Force start map vote (Admin only)")]
     public void OnForceVoteCommand(CCSPlayerController? player, CommandInfo command) => AttemptForceVote(player);
 
+    [ConsoleCommand("finishvote", "End an active vote early (Admin only)")]
+    public void OnFinishVoteCommand(CCSPlayerController? player, CommandInfo command) => AttemptFinishVote(player);
+
+    [ConsoleCommand("endwarmup", "End the current warmup (Admin only)")]
+    public void OnEndWarmupCommand(CCSPlayerController? player, CommandInfo command) => AttemptEndWarmup(player);
+
     [ConsoleCommand("help", "List available commands")]
     public void OnHelpCommand(CCSPlayerController? player, CommandInfo command) => PrintHelp(player);
 
@@ -507,6 +515,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (cmd.Equals("nominatelist", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNominationList(p)); return HookResult.Continue; }
         if (cmd.Equals("help", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintHelp(p)); return HookResult.Continue; }
         if (cmd.Equals("forcevote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceVote(p)); return HookResult.Continue; }
+        if (cmd.Equals("finishvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptFinishVote(p)); return HookResult.Continue; }
+        if (cmd.Equals("endwarmup", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndWarmup(p)); return HookResult.Continue; }
         if (cmd.Equals("votedebug", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptVoteDebug(p)); return HookResult.Continue; }
         if (cmd.Equals("revote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptRevote(p)); return HookResult.Continue; }
         if (cmd.Equals("nextmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNextMap(p)); return HookResult.Continue; }
@@ -1043,6 +1053,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         LogRoutine(new { player, selectedMap }, null);
         _pendingMapId = selectedMap.Id;
         _nextMapName = selectedMap.Name;
+        _nextMapSetByAdmin = true;
+        _voteFinished = true;
         
         string rawMsg = $"{player.PlayerName} has set the next map to {selectedMap.Name}.";
         string dashes = new string('-', rawMsg.Length);
@@ -1053,6 +1065,52 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
 
     private void CloseSetNextMapMenu(CCSPlayerController player) { _setnextmapPlayers.Remove(player.Slot); _playerSetNextMapPage.Remove(player.Slot); }
+
+    // --- FinishVote Logic ---
+    private void AttemptFinishVote(CCSPlayerController? player)
+    {
+        LogRoutine(new { player }, null);
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+
+        if (!_voteInProgress)
+        {
+            p.PrintToChat($" {ColorDefault}There is no vote currently in progress.");
+            return;
+        }
+
+        Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} ended the vote early.");
+        EndVote();
+    }
+
+    // --- EndWarmup Logic ---
+    private void AttemptEndWarmup(CCSPlayerController? player)
+    {
+        LogRoutine(new { player }, null);
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+
+        if (!IsWarmup())
+        {
+            p.PrintToChat($" {ColorDefault}The server is not currently in warmup.");
+            return;
+        }
+
+        Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} ended the warmup.");
+        Server.ExecuteCommand("mp_warmup_end");
+    }
 
     // --- ForceVote Logic ---
     private void AttemptForceVote(CCSPlayerController? player)
@@ -1233,17 +1291,17 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _previousWinningMapId = null;
         _previousWinningMapName = null;
 
+        if (voteCount > 0 && Config.ShowMidVoteProgress)
+        {
+            PrintVoteProgress();
+        }
+
         string rawMsg = $"Winner: {_nextMapName}" + (voteCount > 0 ? $" with {voteCount} votes!" : " (Random/Previous)");
         string dashes = new string('-', rawMsg.Length);
 
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
         Server.PrintToChatAll($" {ColorDefault}Winner: {ColorGreen}{_nextMapName}{ColorDefault}" + (voteCount > 0 ? $" with {ColorGreen}{voteCount}{ColorDefault} votes!" : " (Random/Previous)"));
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
-        
-        if (voteCount > 0 && Config.ShowMidVoteProgress)
-        {
-            PrintVoteProgress();
-        }
 
         _nominatedMaps.Clear(); _hasNominatedSteamIds.Clear(); _nominationOwner.Clear(); _nominationNames.Clear();
 
@@ -1286,7 +1344,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         var voteCounts = _playerVotes.Values
             .GroupBy(v => v)
             .Select(g => new { OptionId = g.Key, Count = g.Count() })
-            .OrderByDescending(x => x.Count)
+            .OrderBy(x => x.Count)
             .ToList();
 
         Server.PrintToChatAll($" {ColorDefault}--- {ColorGreen}Vote Results {ColorDefault}---");
@@ -1302,7 +1360,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
         LogRoutine(new { @event, info }, null);
-        if (_voteFinished || _voteInProgress) return HookResult.Continue;
+        if (_voteFinished || _voteInProgress || _nextMapSetByAdmin) return HookResult.Continue;
         var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules;
         if (rules != null && rules.TotalRoundsPlayed + 1 == Config.VoteRound) StartMapVote(isRtv: false);
         return HookResult.Continue;
