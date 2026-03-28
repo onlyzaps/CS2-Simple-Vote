@@ -59,7 +59,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // Data Sources
     private List<MapItem> _availableMaps = new();
     private List<MapItem> _recentMaps = new();
-    private readonly HttpClient _httpClient = new();
+    private HttpClient _httpClient = new();
     private CounterStrikeSharp.API.Modules.Timers.Timer? _reminderTimer;
     private CounterStrikeSharp.API.Modules.Timers.Timer? _mapInfoTimer;
     private CounterStrikeSharp.API.Modules.Timers.Timer? _centerMessageTimer;
@@ -98,7 +98,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private readonly Dictionary<int, int> _playerSetNextMapPage = new();
 
     // Logger
-    private readonly BlockingCollection<string> _logQueue = new();
+    private BlockingCollection<string> _logQueue = new();
     private Task? _logTask;
     private string _logFilePath = "";
 
@@ -123,6 +123,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     public override void Load(bool hotReload)
     {
+        _unloaded = false;
+
+        // Reset all vote/match state on hot reload to prevent stale flags
+        // (ResetState normally only runs on OnMapStart, which doesn't fire on reload)
+        if (hotReload)
+        {
+            ResetState();
+        }
+
         // Construct the path to the config folder manually:
         // ModuleDirectory is ".../plugins/CS2SimpleVote"
         // We want ".../configs/plugins/CS2SimpleVote"
@@ -166,12 +175,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             if (caller != null) { cmdInfo.ReplyToCommand("This command can only be used from the server console."); return; }
             if (_availableMaps.Count == 0) { cmdInfo.ReplyToCommand("[CS2SimpleVote] No maps loaded yet. API may still be fetching."); return; }
-            cmdInfo.ReplyToCommand($"--- CS2SimpleVote: {_availableMaps.Count} Available Maps ---");
+            cmdInfo.ReplyToCommand($"--- CS2SimpleVote: {_availableMaps.Count} Available Maps (Collection: {Config.CollectionId}) ---");
             foreach (var map in _availableMaps.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
             {
                 cmdInfo.ReplyToCommand($"  {map.Name}  (ID: {map.Id})");
             }
-            cmdInfo.ReplyToCommand("--- End ---");
+            cmdInfo.ReplyToCommand($"--- End ({_availableMaps.Count} maps loaded) ---");
         });
     }
 
@@ -229,11 +238,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         RemoveCommandListener("say", OnPlayerChat, HookMode.Post);
         RemoveCommandListener("say_team", OnPlayerChat, HookMode.Post);
 
-        // 7. Dispose managed resources and recreate CTS for potential hot reload
+        // 7. Dispose managed resources and recreate for potential hot reload
         _cts.Dispose();
         _cts = new CancellationTokenSource();
-        _logQueue.Dispose();
-        _httpClient.Dispose();
+
+        try { _logQueue.Dispose(); } catch { }
+        _logQueue = new BlockingCollection<string>();
+
+        try { _httpClient.Dispose(); } catch { }
+        _httpClient = new HttpClient();
     }
 
     private void OnMapStart(string mapName)
@@ -470,20 +483,75 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             using var itemDoc = JsonDocument.Parse(itemJson);
 
             var newMapList = new List<MapItem>();
+            var failedIds = new List<string>();
             if (itemDoc.RootElement.TryGetProperty("response", out var itemResp) && itemResp.TryGetProperty("publishedfiledetails", out var pubDetails))
             {
                 foreach (var item in pubDetails.EnumerateArray())
                 {
-                    if (item.TryGetProperty("title", out var titleProp) && item.TryGetProperty("publishedfileid", out var idProp))
+                    string? mapId = item.TryGetProperty("publishedfileid", out var idProp) ? idProp.GetString() : null;
+                    string? mapName = item.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
+
+                    if (string.IsNullOrEmpty(mapId))
                     {
-                        string? mapName = titleProp.GetString();
-                        string? mapId = idProp.GetString();
-                        if (!string.IsNullOrEmpty(mapName) && !string.IsNullOrEmpty(mapId))
+                        Console.WriteLine($"[CS2SimpleVote] Skipped collection item: missing publishedfileid");
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(mapName))
+                    {
+                        int result = item.TryGetProperty("result", out var resProp) ? resProp.GetInt32() : -1;
+                        Console.WriteLine($"[CS2SimpleVote] Map ID {mapId} failed on legacy API (result code: {result}), will retry with modern API...");
+                        failedIds.Add(mapId);
+                        continue;
+                    }
+
+                    newMapList.Add(new MapItem { Id = mapId, Name = mapName });
+                }
+            }
+
+            // Retry failed items using the modern IPublishedFileService endpoint
+            if (failedIds.Count > 0)
+            {
+                Console.WriteLine($"[CS2SimpleVote] Retrying {failedIds.Count} item(s) via IPublishedFileService/GetDetails...");
+                try
+                {
+                    var queryParts = new List<string> { $"key={Uri.EscapeDataString(Config.SteamApiKey)}" };
+                    for (int i = 0; i < failedIds.Count; i++)
+                        queryParts.Add($"publishedfileids%5B{i}%5D={failedIds[i]}");
+                    var retryUrl = $"https://api.steampowered.com/IPublishedFileService/GetDetails/v1/?{string.Join("&", queryParts)}";
+
+                    var retryRes = await _httpClient.GetAsync(retryUrl, token);
+                    string retryJson = await retryRes.Content.ReadAsStringAsync(token);
+                    using var retryDoc = JsonDocument.Parse(retryJson);
+
+                    if (retryDoc.RootElement.TryGetProperty("response", out var retryResp) && retryResp.TryGetProperty("publishedfiledetails", out var retryDetails))
+                    {
+                        foreach (var item in retryDetails.EnumerateArray())
                         {
-                            newMapList.Add(new MapItem { Id = mapId, Name = mapName });
+                            string? mapId = item.TryGetProperty("publishedfileid", out var ridProp) ? ridProp.GetString() : null;
+                            string? mapName = item.TryGetProperty("title", out var rtitleProp) ? rtitleProp.GetString() : null;
+
+                            if (!string.IsNullOrEmpty(mapId) && !string.IsNullOrEmpty(mapName))
+                            {
+                                Console.WriteLine($"[CS2SimpleVote] Recovered map via modern API: {mapName} (ID: {mapId})");
+                                newMapList.Add(new MapItem { Id = mapId, Name = mapName });
+                            }
+                            else if (!string.IsNullOrEmpty(mapId))
+                            {
+                                Console.WriteLine($"[CS2SimpleVote] Map ID {mapId} also failed on modern API — item is likely deleted or banned");
+                            }
                         }
                     }
                 }
+                catch (Exception retryEx)
+                {
+                    Console.WriteLine($"[CS2SimpleVote] Modern API retry failed: {retryEx.Message}");
+                }
+            }
+
+            if (newMapList.Count < fileIds.Count)
+            {
+                Console.WriteLine($"[CS2SimpleVote] WARNING: {fileIds.Count - newMapList.Count} of {fileIds.Count} collection items could not be loaded");
             }
 
             _availableMaps = newMapList;
