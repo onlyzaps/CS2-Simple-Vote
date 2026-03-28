@@ -58,7 +58,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     // Data Sources
     private List<MapItem> _availableMaps = new();
-    private List<string> _recentMapIds = new();
+    private List<MapItem> _recentMaps = new();
     private readonly HttpClient _httpClient = new();
     private CounterStrikeSharp.API.Modules.Timers.Timer? _reminderTimer;
     private CounterStrikeSharp.API.Modules.Timers.Timer? _mapInfoTimer;
@@ -143,7 +143,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         LogRoutine(new { hotReload }, null);
 
         // Clear existing memory state before loading
-        _recentMapIds.Clear();
+        _recentMaps.Clear();
 
         // 1. Load Data Immediately (Sync)
         LoadMapHistory();
@@ -161,6 +161,18 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         AddCommandListener("say", OnPlayerChat, HookMode.Post);
         AddCommandListener("say_team", OnPlayerChat, HookMode.Post);
+
+        AddCommand("css_dumpmaps", "Dump all available map names to console", (caller, cmdInfo) =>
+        {
+            if (caller != null) { cmdInfo.ReplyToCommand("This command can only be used from the server console."); return; }
+            if (_availableMaps.Count == 0) { cmdInfo.ReplyToCommand("[CS2SimpleVote] No maps loaded yet. API may still be fetching."); return; }
+            cmdInfo.ReplyToCommand($"--- CS2SimpleVote: {_availableMaps.Count} Available Maps ---");
+            foreach (var map in _availableMaps.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                cmdInfo.ReplyToCommand($"  {map.Name}  (ID: {map.Id})");
+            }
+            cmdInfo.ReplyToCommand("--- End ---");
+        });
     }
 
     public override void Unload(bool hotReload)
@@ -191,7 +203,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         // 5. Clear collections to release references
         _availableMaps.Clear();
-        _recentMapIds.Clear();
+        _recentMaps.Clear();
         _rtvVoters.Clear();
         _activeVoteOptions.Clear();
         _playerVotes.Clear();
@@ -217,8 +229,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         RemoveCommandListener("say", OnPlayerChat, HookMode.Post);
         RemoveCommandListener("say_team", OnPlayerChat, HookMode.Post);
 
-        // 7. Dispose managed resources
+        // 7. Dispose managed resources and recreate CTS for potential hot reload
         _cts.Dispose();
+        _cts = new CancellationTokenSource();
         _logQueue.Dispose();
         _httpClient.Dispose();
     }
@@ -290,16 +303,47 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void LoadMapHistory()
     {
-        if (File.Exists(_historyFilePath))
+        if (!File.Exists(_historyFilePath)) return;
+
+        string json = File.ReadAllText(_historyFilePath);
+
+        // Try loading the new MapItem format first
+        try
         {
-            try { _recentMapIds = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(_historyFilePath)) ?? new List<string>(); }
-            catch { _recentMapIds = new List<string>(); }
+            var loaded = JsonSerializer.Deserialize<List<MapItem>>(json);
+            if (loaded != null && loaded.Count > 0 && !string.IsNullOrEmpty(loaded[0].Id))
+            {
+                _recentMaps = loaded;
+                return;
+            }
         }
+        catch { /* Not MapItem format, try legacy */ }
+
+        // Migrate legacy List<string> format
+        try
+        {
+            var legacyIds = JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
+            _recentMaps = new List<MapItem>();
+            foreach (var raw in legacyIds)
+            {
+                string id = raw;
+                // Extract numeric ID from engine paths like "workshop/123456/de_map"
+                var segments = raw.Split('/');
+                if (segments.Length >= 2 && segments[0].Equals("workshop", StringComparison.OrdinalIgnoreCase)
+                    && segments[1].Length > 0 && segments[1].All(char.IsDigit))
+                {
+                    id = segments[1];
+                }
+                _recentMaps.Add(new MapItem { Id = id, Name = id });
+            }
+            Console.WriteLine($"[CS2SimpleVote] Migrated {_recentMaps.Count} legacy recent map entries.");
+        }
+        catch { _recentMaps = new List<MapItem>(); }
     }
 
     private void SaveMapHistory()
     {
-        try { File.WriteAllText(_historyFilePath, JsonSerializer.Serialize(_recentMapIds)); }
+        try { File.WriteAllText(_historyFilePath, JsonSerializer.Serialize(_recentMaps)); }
         catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Failed to save history: {ex.Message}"); }
     }
 
@@ -335,12 +379,43 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             mapItem = _availableMaps.FirstOrDefault(m => !string.IsNullOrEmpty(m.Name) && (cleanName.Equals(m.Name, StringComparison.OrdinalIgnoreCase) || m.Name.Contains(cleanName, StringComparison.OrdinalIgnoreCase) || cleanName.Contains(m.Name, StringComparison.OrdinalIgnoreCase) && m.Name.Length >= 4));
         }
 
-        string idToAdd = mapItem?.Id ?? currentMapName;
+        string idToAdd;
+        string nameToAdd;
+        if (mapItem != null)
+        {
+            idToAdd = mapItem.Id;
+            nameToAdd = mapItem.Name;
+        }
+        else
+        {
+            // Extract numeric workshop ID from engine paths like "workshop/3070321328/de_dust2"
+            var segments = currentMapName.Split('/');
+            if (segments.Length >= 2 && segments[0].Equals("workshop", StringComparison.OrdinalIgnoreCase)
+                && segments[1].All(char.IsDigit) && segments[1].Length > 0)
+            {
+                idToAdd = segments[1];
+            }
+            else
+            {
+                idToAdd = currentMapName;
+            }
+            nameToAdd = idToAdd;
+        }
 
-        _recentMapIds.RemoveAll(id => id == idToAdd);
-        _recentMapIds.Add(idToAdd);
-        if (_recentMapIds.Count > Config.RecentMapsCount) _recentMapIds.RemoveAt(0);
+        _recentMaps.RemoveAll(m => m.Id == idToAdd);
+        _recentMaps.Add(new MapItem { Id = idToAdd, Name = nameToAdd });
+        if (_recentMaps.Count > Config.RecentMapsCount) _recentMaps.RemoveAt(0);
         SaveMapHistory();
+
+        // Backfill names for any legacy entries now that _availableMaps may be populated
+        for (int i = 0; i < _recentMaps.Count; i++)
+        {
+            if (_recentMaps[i].Name == _recentMaps[i].Id || string.IsNullOrEmpty(_recentMaps[i].Name))
+            {
+                var known = _availableMaps.FirstOrDefault(m => m.Id == _recentMaps[i].Id);
+                if (known != null) _recentMaps[i].Name = known.Name;
+            }
+        }
     }
 
     // --- Steam API ---
@@ -435,7 +510,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     // --- Helpers ---
     private bool IsValidPlayer(CCSPlayerController? player) => player != null && player.IsValid && !player.IsBot && !player.IsHLTV;
-    private bool IsWarmup() => Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules?.WarmupPeriod ?? false;
+    private bool IsWarmup()
+    {
+        try { return Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules?.WarmupPeriod ?? false; }
+        catch { return false; }
+    }
     private bool IsCurrentMap(MapItem map) => Server.MapName.Contains(map.Id, StringComparison.OrdinalIgnoreCase) || Server.MapName.Equals(map.Name, StringComparison.OrdinalIgnoreCase);
     private IEnumerable<CCSPlayerController> GetHumanPlayers() => Utilities.GetPlayers().Where(IsValidPlayer);
 
@@ -471,7 +550,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (cmd.Equals("lastmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintLastMap(p)); return HookResult.Continue; }
         if (cmd.Equals("recentmaps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintRecentMaps(p, args)); return HookResult.Continue; }
 
-        if (cmd.Equals("nominate", StringComparison.OrdinalIgnoreCase))
+        if (cmd.Equals("nominate", StringComparison.OrdinalIgnoreCase) || cmd.Equals("nom", StringComparison.OrdinalIgnoreCase))
         {
             Server.NextFrame(() => AttemptNominate(p, args));
             return HookResult.Continue;
@@ -517,7 +596,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         string loadedStatus = _hasLoadedCollectionMaps ? $"{ColorGreen}Loaded{ColorDefault}" : "Not Loaded";
         string apiStatus = _isApiLoading ? "Loading..." : (_hasLoadedCollectionMaps ? $"{ColorGreen}Finished{ColorDefault}" : "Failed/Not Started");
-        string lastMapDisplay = _recentMapIds.Count > 1 ? GetMapName(_recentMapIds[_recentMapIds.Count - 2]) : "None";
+        string lastMapDisplay = _recentMaps.Count > 1 ? _recentMaps[_recentMaps.Count - 2].Name : "None";
         
         var debugInfo = new List<string>
         {
@@ -580,7 +659,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 ActiveVoteOptions = _activeVoteOptions.ToDictionary(k => k.Key.ToString(), v => v.Value),
                 PlayerVotes = _playerVotes.ToDictionary(k => k.Key.ToString(), v => v.Value),
                 NominatedMaps = _nominatedMaps.Select(m => new { m.Id, m.Name }).ToList(),
-                RecentMapIds = _recentMapIds.ToList()
+                RecentMaps = _recentMaps.Select(m => new { m.Id, m.Name }).ToList()
             }
         };
 
@@ -655,13 +734,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private void PrintLastMap(CCSPlayerController? player)
     {
         LogRoutine(new { player }, null);
-        if (_recentMapIds.Count > 1) 
+        if (_recentMaps.Count > 1) 
         {
-            // The current map is usually pushed to the end of _recentMapIds upon OnMapStart.
+            // The current map is usually pushed to the end of _recentMaps upon OnMapStart.
             // Meaning, the "last" map before the current one is at count - 2.
-            string lastMapId = _recentMapIds[_recentMapIds.Count - 2];
-            string lastMapName = GetMapName(lastMapId);
-            Server.PrintToChatAll($" {ColorDefault}The last played map was: {ColorGreen}{lastMapName}");
+            var lastMap = _recentMaps[_recentMaps.Count - 2];
+            Server.PrintToChatAll($" {ColorDefault}The last played map was: {ColorGreen}{lastMap.Name}");
         }
         else 
         {
@@ -675,7 +753,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (_recentMapIds.Count == 0 || (_recentMapIds.Count == 1 && IsCurrentMap(new MapItem { Id = _recentMapIds[0] })))
+        if (_recentMaps.Count == 0 || (_recentMaps.Count == 1 && IsCurrentMap(_recentMaps[0])))
         {
             p.PrintToChat($" {ColorDefault}No recent maps data available yet.");
             return;
@@ -702,22 +780,19 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         p.PrintToChat($" {ColorGreen}{titleText}");
         p.PrintToChat($" {ColorDefault}{dashes}");
         
-        var recentNames = _recentMapIds
-            .Select(id => GetMapName(id))
-            .Reverse()
-            .ToList();
+        var reversed = _recentMaps.AsEnumerable().Reverse().ToList();
 
         // Print up to recent configurations limit. Skipping index 0 if it's the current map.
         int displayCount = 1;
-        for(int i = 0; i < recentNames.Count; i++)
+        for(int i = 0; i < reversed.Count; i++)
         {
             if (displayCount > maxDisplayCount) break;
 
             // Usually index 0 in the reversed list is the current active map because it gets appended to the end of the history.
             // Let's filter out current map to show only purely *past* maps
-            if (IsCurrentMap(new MapItem { Id = _recentMapIds[_recentMapIds.Count - 1 - i], Name = recentNames[i] })) continue;
+            if (IsCurrentMap(reversed[i])) continue;
 
-            p.PrintToChat($" {ColorGreen}{displayCount}. {ColorDefault}{recentNames[i]}");
+            p.PrintToChat($" {ColorGreen}{displayCount}. {ColorDefault}{reversed[i].Name}");
             displayCount++;
         }
     }
@@ -1135,7 +1210,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
             if (Config.EnableRecentMaps)
             {
-                var filtered = potentialMaps.Where(m => !_recentMapIds.Contains(m.Id)).ToList();
+                var filtered = potentialMaps.Where(m => !_recentMaps.Any(r => r.Id == m.Id)).ToList();
                 // To properly omit them, we will use the filtered maps, even if empty.
                 // We shouldn't fallback to recent maps unless absolutely necessary to fill slots? 
                 // The intent was "make sure the omission list is implemented and actually works", 
@@ -1177,28 +1252,33 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             _reminderTimer = AddTimer(Config.ReminderIntervalSeconds, () => {
                 if (_unloaded) return;
-                foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) { p.PrintToChat($" {ColorDefault}Reminder: Please vote for the next map!"); PrintVoteOptionsToPlayer(p); }
+                try { foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) { p.PrintToChat($" {ColorDefault}Reminder: Please vote for the next map!"); PrintVoteOptionsToPlayer(p); } }
+                catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Reminder timer error: {ex.Message}"); }
             }, TimerFlags.REPEAT);
         }
 
         _centerMessageTimer = AddTimer(1.0f, () => {
             if (_unloaded) return;
-            if (_isForceVote && _previousWinningMapId != null)
+            try
             {
-                _forceVoteTimeRemaining--;
-                int displayTime = Math.Max(0, _forceVoteTimeRemaining);
-                foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) 
-                { 
-                    p.PrintToCenter($"VOTE NOW! Time Remaining: {displayTime}s"); 
+                if (_isForceVote && _previousWinningMapId != null)
+                {
+                    _forceVoteTimeRemaining--;
+                    int displayTime = Math.Max(0, _forceVoteTimeRemaining);
+                    foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) 
+                    { 
+                        p.PrintToCenter($"VOTE NOW! Time Remaining: {displayTime}s"); 
+                    }
+                }
+                else
+                {
+                    foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) 
+                    { 
+                        p.PrintToCenter("VOTE NOW!"); 
+                    }
                 }
             }
-            else
-            {
-                foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) 
-                { 
-                    p.PrintToCenter("VOTE NOW!"); 
-                }
-            }
+            catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Center message timer error: {ex.Message}"); }
         }, TimerFlags.REPEAT);
     }
 
@@ -1287,7 +1367,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintVoteOptionsToAll() { foreach (var p in GetHumanPlayers()) PrintVoteOptionsToPlayer(p); }
     private void PrintVoteOptionsToPlayer(CCSPlayerController player) { player.PrintToChat($" {ColorDefault}Type the {ColorGreen}number{ColorDefault} to vote:"); foreach (var kvp in _activeVoteOptions) player.PrintToChat($" {ColorGreen}[{kvp.Key}] {ColorDefault}{GetMapName(kvp.Value)}"); }
-    private string GetMapName(string mapId) => _availableMaps.FirstOrDefault(m => m.Id == mapId)?.Name ?? "Unknown";
+    private string GetMapName(string mapId)
+    {
+        // Exact match first
+        var map = _availableMaps.FirstOrDefault(m => m.Id == mapId);
+        if (map != null) return map.Name;
+        // Fallback: mapId might be a raw engine path like "workshop/123456/de_map" — check if any map's ID is contained within it
+        map = _availableMaps.FirstOrDefault(m => !string.IsNullOrEmpty(m.Id) && mapId.Contains(m.Id, StringComparison.OrdinalIgnoreCase));
+        return map?.Name ?? mapId;
+    }
 
     private void PrintVoteProgress()
     {
@@ -1312,15 +1400,21 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        if (_unloaded) return HookResult.Continue;
         LogRoutine(new { @event, info }, null);
         if (_voteFinished || _voteInProgress || _nextMapSetByAdmin) return HookResult.Continue;
-        var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules;
-        if (rules != null && rules.TotalRoundsPlayed + 1 == Config.VoteRound) StartMapVote(isRtv: false);
+        try
+        {
+            var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules;
+            if (rules != null && rules.TotalRoundsPlayed + 1 == Config.VoteRound) StartMapVote(isRtv: false);
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] OnRoundStart error: {ex.Message}"); }
         return HookResult.Continue;
     }
 
     private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
     {
+        if (_unloaded) return HookResult.Continue;
         LogRoutine(new { @event, info }, null);
         if (_voteInProgress && _isScheduledVote)
         {
@@ -1360,7 +1454,18 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             EndVote();
         }
 
-        if (!string.IsNullOrEmpty(_pendingMapId)) { Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{GetMapName(_pendingMapId)}{ColorDefault}!"); AddTimer(8.0f, () => Server.ExecuteCommand($"host_workshop_map {_pendingMapId}")); }
+        if (!string.IsNullOrEmpty(_pendingMapId))
+        {
+            string mapIdToChange = _pendingMapId;
+            string mapNameToChange = GetMapName(mapIdToChange);
+            Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{mapNameToChange}{ColorDefault}!");
+            AddTimer(8.0f, () =>
+            {
+                if (_unloaded) return;
+                try { Server.ExecuteCommand($"host_workshop_map {mapIdToChange}"); }
+                catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Map change error (possibly mid-transition): {ex.Message}"); }
+            });
+        }
         return HookResult.Continue;
     }
     private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
