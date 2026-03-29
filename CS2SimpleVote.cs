@@ -89,6 +89,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private readonly Dictionary<int, List<MapItem>> _nominatingPlayers = new();
     private readonly Dictionary<int, int> _playerNominationPage = new();
 
+    private CommandInfo.CommandCallback? _playerChatDelegate;
+
     // State: Forcemap
     private readonly Dictionary<int, List<MapItem>> _forcemapPlayers = new();
     private readonly Dictionary<int, int> _playerForcemapPage = new();
@@ -168,8 +170,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
 
-        AddCommandListener("say", OnPlayerChat, HookMode.Post);
-        AddCommandListener("say_team", OnPlayerChat, HookMode.Post);
+        _playerChatDelegate = OnPlayerChat;
+        AddCommandListener("say", _playerChatDelegate, HookMode.Post);
+        AddCommandListener("say_team", _playerChatDelegate, HookMode.Post);
 
         AddCommand("css_dumpmaps", "Dump all available map names to console", (caller, cmdInfo) =>
         {
@@ -235,8 +238,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
 
-        RemoveCommandListener("say", OnPlayerChat, HookMode.Post);
-        RemoveCommandListener("say_team", OnPlayerChat, HookMode.Post);
+        if (_playerChatDelegate != null)
+        {
+            RemoveCommandListener("say", _playerChatDelegate, HookMode.Post);
+            RemoveCommandListener("say_team", _playerChatDelegate, HookMode.Post);
+            _playerChatDelegate = null;
+        }
 
         // 7. Dispose managed resources and recreate for potential hot reload
         _cts.Dispose();
