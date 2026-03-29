@@ -89,7 +89,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private readonly Dictionary<int, List<MapItem>> _nominatingPlayers = new();
     private readonly Dictionary<int, int> _playerNominationPage = new();
 
-    private CommandInfo.CommandCallback? _playerChatDelegate;
+    private CommandInfo.CommandListenerCallback? _playerChatDelegate;
 
     // State: Forcemap
     private readonly Dictionary<int, List<MapItem>> _forcemapPlayers = new();
