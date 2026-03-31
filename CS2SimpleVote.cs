@@ -275,7 +275,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 // Find full title from available maps
                 string displayMapName = _availableMaps.FirstOrDefault(m => mapName.Contains(m.Name) || m.Id == mapName || mapName.Contains(m.Id))?.Name ?? mapName;
                 Server.PrintToChatAll($" {ColorDefault}You're playing {ColorGreen}{displayMapName}{ColorDefault} on {ColorGreen}{Config.ServerName}{ColorDefault}!");
-            }, TimerFlags.REPEAT);
+            }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
         }
     }
 
@@ -1302,7 +1302,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (isRtv)
         {
             Server.PrintToChatAll($" {ColorDefault}Vote ending in 30 seconds!");
-            AddTimer(30.0f, () => EndVote());
+            AddTimer(30.0f, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
         }
         else if (isForceVote && _previousWinningMapId != null) // Scenario: Vote already happened
         {
@@ -1311,7 +1311,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
              // Request says center message: "VOTE NOW! Time Remaining: 30s"
              // Typically we should also print to chat.
              Server.PrintToChatAll($" {ColorDefault}Vote ending in 30 seconds!");
-             AddTimer(30.0f, () => EndVote());
+             AddTimer(30.0f, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
         }
         else
         {
@@ -1329,7 +1329,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 if (_unloaded) return;
                 try { foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot))) { p.PrintToChat($" {ColorDefault}Reminder: Please vote for the next map!"); PrintVoteOptionsToPlayer(p); } }
                 catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Reminder timer error: {ex.Message}"); }
-            }, TimerFlags.REPEAT);
+            }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
         }
 
         _centerMessageTimer = AddTimer(1.0f, () => {
@@ -1354,7 +1354,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 }
             }
             catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Center message timer error: {ex.Message}"); }
-        }, TimerFlags.REPEAT);
+        }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
     }
 
     private HookResult HandleVoteInput(CCSPlayerController player, string input)
@@ -1534,12 +1534,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             string mapIdToChange = _pendingMapId;
             string mapNameToChange = GetMapName(mapIdToChange);
             Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{mapNameToChange}{ColorDefault}!");
-            AddTimer(8.0f, () =>
+            AddTimer(5.0f, () =>
             {
                 if (_unloaded) return;
                 try { Server.ExecuteCommand($"host_workshop_map {mapIdToChange}"); }
                 catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Map change error (possibly mid-transition): {ex.Message}"); }
-            });
+            }, TimerFlags.STOP_ON_MAPCHANGE);
         }
         return HookResult.Continue;
     }
