@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CS2SimpleVote", "CS2SimpleVote.csproj", "{73434556-B7C1-9CFA-4FFA-5CE7E1CD56C4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{73434556-B7C1-9CFA-4FFA-5CE7E1CD56C4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{73434556-B7C1-9CFA-4FFA-5CE7E1CD56C4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{73434556-B7C1-9CFA-4FFA-5CE7E1CD56C4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{73434556-B7C1-9CFA-4FFA-5CE7E1CD56C4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {57ED6AF4-A96E-4731-8B30-9E6F01E7A9E2}
+	EndGlobalSection
+EndGlobal

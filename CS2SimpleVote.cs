@@ -185,6 +185,54 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             }
             cmdInfo.ReplyToCommand($"--- End ({_availableMaps.Count} maps loaded) ---");
         });
+
+        AddCommand("css_setnextmap", "Set the next map by partial name match", (caller, cmdInfo) =>
+        {
+            if (caller != null)
+            {
+                if (!Config.Admins.Contains(caller.SteamID))
+                {
+                    cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                    return;
+                }
+            }
+            string searchTerm = cmdInfo.GetArg(1);
+            if (string.IsNullOrEmpty(searchTerm)) { cmdInfo.ReplyToCommand("[CS2SimpleVote] Usage: css_setnextmap <partial map name>"); return; }
+            if (_availableMaps.Count == 0) { cmdInfo.ReplyToCommand("[CS2SimpleVote] No maps loaded yet."); return; }
+
+            var match = FindBestMapMatch(searchTerm);
+            if (match == null) { cmdInfo.ReplyToCommand($"[CS2SimpleVote] No map found matching: {searchTerm}"); return; }
+
+            _pendingMapId = match.Id;
+            _nextMapName = match.Name;
+            _nextMapSetByAdmin = true;
+            _voteFinished = true;
+
+            cmdInfo.ReplyToCommand($"[CS2SimpleVote] Next map set to: {match.Name} (ID: {match.Id})");
+            Server.PrintToChatAll($" {ColorDefault}The next map has been set to {ColorGreen}{match.Name}{ColorDefault}.");
+        });
+
+        AddCommand("css_forcemap", "Force change to a map by partial name match", (caller, cmdInfo) =>
+        {
+            if (caller != null)
+            {
+                if (!Config.Admins.Contains(caller.SteamID))
+                {
+                    cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                    return;
+                }
+            }
+            string searchTerm = cmdInfo.GetArg(1);
+            if (string.IsNullOrEmpty(searchTerm)) { cmdInfo.ReplyToCommand("[CS2SimpleVote] Usage: css_forcemap <partial map name>"); return; }
+            if (_availableMaps.Count == 0) { cmdInfo.ReplyToCommand("[CS2SimpleVote] No maps loaded yet."); return; }
+
+            var match = FindBestMapMatch(searchTerm);
+            if (match == null) { cmdInfo.ReplyToCommand($"[CS2SimpleVote] No map found matching: {searchTerm}"); return; }
+
+            cmdInfo.ReplyToCommand($"[CS2SimpleVote] Forcing map change to: {match.Name} (ID: {match.Id})");
+            Server.PrintToChatAll($" {ColorDefault}Map is being changed to {ColorGreen}{match.Name}{ColorDefault}.");
+            Server.ExecuteCommand($"host_workshop_map {match.Id}");
+        });
     }
 
     public override void Unload(bool hotReload)
@@ -584,6 +632,31 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
 
     // --- Helpers ---
+    private MapItem? FindBestMapMatch(string searchTerm)
+    {
+        if (string.IsNullOrEmpty(searchTerm) || _availableMaps.Count == 0) return null;
+
+        // Exact match (case-insensitive)
+        var exact = _availableMaps.FirstOrDefault(m => m.Name.Equals(searchTerm, StringComparison.OrdinalIgnoreCase));
+        if (exact != null) return exact;
+
+        // Starts with - pick shortest name (most specific)
+        var startsWith = _availableMaps
+            .Where(m => m.Name.StartsWith(searchTerm, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(m => m.Name.Length)
+            .FirstOrDefault();
+        if (startsWith != null) return startsWith;
+
+        // Contains - pick shortest name (most specific)
+        var contains = _availableMaps
+            .Where(m => m.Name.Contains(searchTerm, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(m => m.Name.Length)
+            .FirstOrDefault();
+        if (contains != null) return contains;
+
+        return null;
+    }
+
     private bool IsValidPlayer(CCSPlayerController? player) => player != null && player.IsValid && !player.IsBot && !player.IsHLTV;
     private bool IsWarmup()
     {
