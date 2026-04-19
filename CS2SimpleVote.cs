@@ -63,6 +63,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private CounterStrikeSharp.API.Modules.Timers.Timer? _reminderTimer;
     private CounterStrikeSharp.API.Modules.Timers.Timer? _mapInfoTimer;
     private CounterStrikeSharp.API.Modules.Timers.Timer? _centerMessageTimer;
+    private CounterStrikeSharp.API.Modules.Timers.Timer? _voteEndTimer;
+    private CounterStrikeSharp.API.Modules.Timers.Timer? _mapChangeTimer;
 
     // State: Voting
     private bool _voteInProgress;
@@ -250,6 +252,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _mapInfoTimer = null;
         _centerMessageTimer?.Kill();
         _centerMessageTimer = null;
+        _voteEndTimer?.Kill();
+        _voteEndTimer = null;
+        _mapChangeTimer?.Kill();
+        _mapChangeTimer = null;
 
         // 3. Complete the log queue so the log writer can drain and exit
         try { _logQueue.CompleteAdding(); } catch (ObjectDisposedException) { }
@@ -365,6 +371,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         _centerMessageTimer?.Kill();
         _centerMessageTimer = null;
+
+        _voteEndTimer?.Kill();
+        _voteEndTimer = null;
+
+        _mapChangeTimer?.Kill();
+        _mapChangeTimer = null;
     }
 
     // --- File Persistence ---
@@ -1375,7 +1387,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (isRtv)
         {
             Server.PrintToChatAll($" {ColorDefault}Vote ending in 30 seconds!");
-            AddTimer(30.0f, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
+            _voteEndTimer = AddTimer(30.0f, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
         }
         else if (isForceVote && _previousWinningMapId != null) // Scenario: Vote already happened
         {
@@ -1384,7 +1396,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
              // Request says center message: "VOTE NOW! Time Remaining: 30s"
              // Typically we should also print to chat.
              Server.PrintToChatAll($" {ColorDefault}Vote ending in 30 seconds!");
-             AddTimer(30.0f, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
+             _voteEndTimer = AddTimer(30.0f, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
         }
         else
         {
@@ -1443,6 +1455,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!_voteInProgress) return;
         _voteInProgress = false; _voteFinished = true; _reminderTimer?.Kill(); _reminderTimer = null;
         _centerMessageTimer?.Kill(); _centerMessageTimer = null;
+        _voteEndTimer?.Kill(); _voteEndTimer = null;
         string winningMapId; int voteCount;
 
         // Special Logic: Force Vote with existing winner
@@ -1607,7 +1620,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             string mapIdToChange = _pendingMapId;
             string mapNameToChange = GetMapName(mapIdToChange);
             Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{mapNameToChange}{ColorDefault}!");
-            AddTimer(5.0f, () =>
+            _mapChangeTimer = AddTimer(5.0f, () =>
             {
                 if (_unloaded) return;
                 try { Server.ExecuteCommand($"host_workshop_map {mapIdToChange}"); }
