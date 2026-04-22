@@ -7,14 +7,15 @@ A lightweight, robust, and feature-rich map voting plugin for Counter-Strike 2, 
 ## 🚀 Key Features
 
 *   ✅ **Automated Voting**: Trigger a map vote automatically at a configurable round number.
-*   🔥 **Rock The Vote (RTV)**: Allow players to initiate a vote to change the map immediately.
+*   🔥 **Rock The Vote (RTV)**: Allow players to initiate a vote to change the map immediately. When the RTV vote resolves, the winning map loads right away (after a short configurable delay) — no waiting for end-of-match.
 *   🗳️ **Nomination System**: 
     *   Players can nominate specific maps from the collection.
     *   **Search Support**: Use `!nominate <term>` to filter maps by name.
     *   **Auto-Selection**: If a search term matches only one map, it is nominated instantly.
     *   **Re-nomination**: Players can change their nomination at any time.
 *   📜 **Recent Map History**: Prevents recently played maps from appearing in the automated vote pool.
-*   🛠️ **Workshop Integration**: Automatically fetches and caches maps from a specified Steam Workshop Collection via both legacy and modern Steam APIs.
+*   🛠️ **Workshop Integration**: Fetches and caches maps from a specified Steam Workshop Collection via the modern `IPublishedFileService/GetDetails` endpoint.
+*   🧩 **Nested Collection Support**: Collections that contain other collections are fully supported. The loader performs a recursive BFS through every nested collection and includes all maps — both directly attached to the root and from any depth of nested collections — in a single flat map pool.
 *   📢 **Interactive HUD**: Displays a "VOTE NOW!" center-screen alert (with countdown timer for force votes) for players who haven't voted yet.
 *   💬 **Smart Announcements**: Customizable server name and recurring messages showing the current map.
 *   📊 **Mid-Vote Progress**: Optionally displays live vote tallies when a vote ends.
@@ -69,7 +70,7 @@ To grant admin access, add your SteamID64 (decimal format, starts with 7) to the
 Lists all available commands in chat. Admins see additional admin-only commands.
 
 ### `!rtv`
-Add your vote to change the current map. Once the configured percentage of players have voted, a map vote starts immediately.
+Add your vote to change the current map. Once the configured percentage of players have voted, a map vote starts immediately. When the RTV vote resolves, the winning map loads right away after `rtv_change_delay` seconds — it does *not* wait for the match to end.
 ```text
 PlayerName wants to change the map! (1/5)
 ```
@@ -121,6 +122,12 @@ Last 5 Recent Maps
 3. cs_office
 4. de_nuke
 5. de_vertigo
+```
+
+### `!maplist`
+Prints the full alphabetical list of every map loaded from the Workshop collection (including maps pulled in from nested collections) to your personal client console. A chat message confirms how many maps were sent. Open the console with `~` to view the list.
+```text
+All 42 maps were sent to your console. Press ~ to view.
 ```
 
 ---

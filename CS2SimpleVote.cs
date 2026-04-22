@@ -72,6 +72,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private bool _isScheduledVote;
     private int _currentVoteRoundDuration;
     private bool _isForceVote;
+    private bool _isRtvVote;
     private string? _previousWinningMapId;
     private string? _previousWinningMapName;
     private bool _matchEnded;
@@ -327,6 +328,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _voteFinished = false;
         _isScheduledVote = false;
         _isForceVote = false;
+        _isRtvVote = false;
         _currentVoteRoundDuration = 0;
         _nextMapName = null;
         _pendingMapId = null;
@@ -687,6 +689,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (cmd.Equals("nextmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNextMap(p)); return HookResult.Continue; }
         if (cmd.Equals("lastmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintLastMap(p)); return HookResult.Continue; }
         if (cmd.Equals("recentmaps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintRecentMaps(p, args)); return HookResult.Continue; }
+        if (cmd.Equals("maplist", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintMapListToConsole(p)); return HookResult.Continue; }
 
         if (cmd.Equals("nominate", StringComparison.OrdinalIgnoreCase) || cmd.Equals("nom", StringComparison.OrdinalIgnoreCase))
         {
@@ -837,6 +840,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         p.PrintToChat($" {ColorGreen}!help {ColorDefault}- List available commands");
         p.PrintToChat($" {ColorGreen}!lastmap {ColorDefault}- Show last played map");
+        p.PrintToChat($" {ColorGreen}!maplist {ColorDefault}- Print the full map list to your console");
         p.PrintToChat($" {ColorGreen}!nextmap {ColorDefault}- Show next map");
         p.PrintToChat($" {ColorGreen}!nominate [name] {ColorDefault}- Nominate a map");
         p.PrintToChat($" {ColorGreen}!nominatelist {ColorDefault}- List nominated maps");
@@ -927,6 +931,28 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             p.PrintToChat($" {ColorGreen}{displayCount}. {ColorDefault}{reversed[i].Name}");
             displayCount++;
         }
+    }
+
+    private void PrintMapListToConsole(CCSPlayerController? player)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+
+        if (_availableMaps.Count == 0)
+        {
+            p.PrintToChat($" {ColorDefault}No maps loaded yet. Try again once the Workshop collection has finished fetching.");
+            return;
+        }
+
+        var sorted = _availableMaps.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        p.PrintToConsole($"--- CS2SimpleVote: {sorted.Count} Available Maps (Collection: {Config.CollectionId}) ---");
+        foreach (var map in sorted)
+        {
+            p.PrintToConsole($"  {map.Name}  (ID: {map.Id})");
+        }
+        p.PrintToConsole($"--- End ({sorted.Count} maps) ---");
+
+        p.PrintToChat($" {ColorDefault}All {ColorGreen}{sorted.Count}{ColorDefault} maps were sent to your console. Press {ColorGreen}~{ColorDefault} to view.");
     }
 
     private void AttemptRtv(CCSPlayerController? player)
@@ -1324,6 +1350,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         bool isRevote = isForceVote && _previousWinningMapId != null;
         _isScheduledVote = (!isRtv && !isForceVote) || (isForceVote && !isRevote);
         _isForceVote = isForceVote;
+        _isRtvVote = isRtv;
 
         _nextMapName = null; 
         _pendingMapId = null;
@@ -1468,29 +1495,27 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         _nominatedMaps.Clear(); _hasNominatedSteamIds.Clear(); _nominationOwner.Clear(); _nominationNames.Clear();
 
-        // If it was an RTV, or a ForceVote that happened AFTER normal vote (implied by this not being a scheduled vote), change immediately/soon
-        // Logic: 
-        // 1. RTV -> Change ID
-        // 2. ForceVote -> If handled like normal vote (no prev winner) -> End of match
-        // 3. ForceVote -> If handled like special vote (prev winner existed) -> Schedule for next map (End of match), but apply ID now?
-        // Wait, "apply the map as the next map (on scoreboard)" implies pending ID.
+        // RTV wins change the map immediately (after the configured short delay).
+        // Scheduled and force votes still pend the winner for end-of-match.
+        if (_isRtvVote)
+        {
+            _isRtvVote = false;
+            _pendingMapId = null;
+            _nextMapSetByAdmin = false;
+            float delay = Math.Max(0f, Config.RtvDelaySeconds);
+            string mapIdToChange = winningMapId;
+            string mapNameToChange = _nextMapName ?? GetMapName(winningMapId);
+            Log("MAPCHANGE", $"RTV winner {mapNameToChange} ({mapIdToChange}) — changing map in {delay}s");
+            Server.PrintToChatAll($" {ColorDefault}Changing map to {ColorGreen}{mapNameToChange}{ColorDefault} in {ColorGreen}{delay:0.#}{ColorDefault}s...");
+            _mapChangeTimer = AddTimer(delay, () =>
+            {
+                if (_unloaded) return;
+                try { Server.ExecuteCommand($"host_workshop_map {mapIdToChange}"); }
+                catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] RTV map change error: {ex.Message}"); }
+            }, TimerFlags.STOP_ON_MAPCHANGE);
+            return;
+        }
 
-        // Refined Logic based on request:
-        // "If no previous map vote has happened, treat this as a normal map vote... do not bring the normal map vote up"
-        // In that case, we want pending ID for end of match, NOT immediate change.
-
-        // So only RTV triggers immediate change. 
-        // Wait, what if ForceVote was triggered "like RTV" (e.g. immediate change desired)? 
-        // The request doesn't explicitly say ForceVote changes map immediately, it says "apply the map as the next map (on scoreboard)".
-        // So behavior is consistent: Pending ID for end of match.
-
-        // RTV is the only one that forces immediate change logic in original code?
-        // Original: if (isRtv) ... ExecuteCommand ... else ... Map will change at end of match.
-        
-        // Since StartMapVote(isRtv: false, isForceVote: true) is called:
-        // isRtv is false. 
-        // So we fall to else block.
-        
         _pendingMapId = winningMapId; 
         Server.PrintToChatAll($" {ColorDefault}Map will change at the end of the match."); 
     }
