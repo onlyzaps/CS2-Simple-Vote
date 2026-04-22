@@ -492,228 +492,121 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             _isApiLoading = true;
 
-            // BFS: expand collections via GetCollectionDetails, accumulating candidate item IDs.
-            // We also re-verify every "map" candidate via GetPublishedFileDetails.file_type, because
-            // the `filetype` field inside GetCollectionDetails.children is sometimes absent or 0
-            // for items that are actually nested collections — and missing it means direct maps
-            // in the root collection get silently dropped when they share a response with a
-            // nested collection. Checking file_type from details is the authoritative signal.
-            var pendingCollections = new Queue<string>();
+            // Uses the modern IPublishedFileService/GetDetails endpoint with includechildren=true.
+            // This returns, for each ID, its title, file_type, and (when it's a collection) its
+            // children[] with file_type set. One endpoint handles both items and collections, so
+            // the whole traversal is a BFS over GetDetails.
+            //   file_type == 2  -> collection; enqueue each child
+            //   file_type != 2  -> workshop item (map); take title
+            // Items that come back with result != 1 (deleted/banned/private) are skipped.
+            var maps = new List<MapItem>();
+            var seenMaps = new HashSet<string>();
+            var pending = new Queue<string>();
             var visited = new HashSet<string>();
-            var candidateItemIds = new HashSet<string>();
-            pendingCollections.Enqueue(Config.CollectionId);
+
+            pending.Enqueue(Config.CollectionId);
             visited.Add(Config.CollectionId);
-            bool rootExpanded = false;
+            bool rootResolved = false;
+            int rootResultCode = 0;
 
-            async Task ExpandCollectionsAsync()
+            while (pending.Count > 0)
             {
-                while (pendingCollections.Count > 0)
+                // GetDetails accepts many IDs per call; Steam caps it around a few hundred but
+                // 100 per batch keeps URL length reasonable and matches legacy behavior.
+                var batch = new List<string>();
+                while (pending.Count > 0 && batch.Count < 100)
+                    batch.Add(pending.Dequeue());
+
+                var queryParts = new List<string> {
+                    $"key={Uri.EscapeDataString(Config.SteamApiKey)}",
+                    "includechildren=true"
+                };
+                for (int i = 0; i < batch.Count; i++)
+                    queryParts.Add($"publishedfileids%5B{i}%5D={batch[i]}");
+                var url = $"https://api.steampowered.com/IPublishedFileService/GetDetails/v1/?{string.Join("&", queryParts)}";
+
+                var httpRes = await _httpClient.GetAsync(url, token);
+                if (!httpRes.IsSuccessStatusCode)
                 {
-                    var batch = new List<string>();
-                    while (pendingCollections.Count > 0 && batch.Count < 100)
-                        batch.Add(pendingCollections.Dequeue());
+                    string err = await httpRes.Content.ReadAsStringAsync(token);
+                    throw new Exception($"IPublishedFileService/GetDetails HTTP {(int)httpRes.StatusCode}: {err}");
+                }
+                string json = await httpRes.Content.ReadAsStringAsync(token);
+                using var doc = JsonDocument.Parse(json);
 
-                    var collPairs = new List<KeyValuePair<string, string>> {
-                        new("key", Config.SteamApiKey),
-                        new("collectioncount", batch.Count.ToString())
-                    };
-                    for (int i = 0; i < batch.Count; i++)
-                        collPairs.Add(new($"publishedfileids[{i}]", batch[i]));
+                if (!doc.RootElement.TryGetProperty("response", out var respEl) ||
+                    !respEl.TryGetProperty("publishedfiledetails", out var detailsArr))
+                {
+                    if (batch.Contains(Config.CollectionId))
+                        throw new Exception("Steam API returned no publishedfiledetails for the root collection. Check Collection ID.");
+                    continue;
+                }
 
-                    var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", new FormUrlEncodedContent(collPairs), token);
-                    string collJson = await collRes.Content.ReadAsStringAsync(token);
-                    using var collDoc = JsonDocument.Parse(collJson);
+                foreach (var item in detailsArr.EnumerateArray())
+                {
+                    string? id = item.TryGetProperty("publishedfileid", out var idp) ? idp.GetString() : null;
+                    if (string.IsNullOrEmpty(id)) continue;
 
-                    var rootResp = collDoc.RootElement.GetProperty("response");
-                    if (!rootResp.TryGetProperty("collectiondetails", out var collDetails) || collDetails.GetArrayLength() == 0)
+                    int result = item.TryGetProperty("result", out var resp) ? resp.GetInt32() : 0;
+                    int fileType = item.TryGetProperty("file_type", out var ftp) ? ftp.GetInt32() : 0;
+                    bool isRoot = id == Config.CollectionId;
+
+                    if (isRoot)
                     {
-                        if (batch.Contains(Config.CollectionId))
-                            throw new Exception("Invalid response or missing collection details from Steam API. Check Collection ID.");
+                        rootResolved = true;
+                        rootResultCode = result;
+                    }
+
+                    if (result != 1)
+                    {
+                        if (isRoot)
+                            throw new Exception($"Root collection is inaccessible. Steam result code: {result}. Ensure the Steam API Key is valid and the collection is public.");
+                        Console.WriteLine($"[CS2SimpleVote] Skipping {id}: Steam result code {result} (likely deleted/private/banned).");
                         continue;
                     }
 
-                    foreach (var collEntry in collDetails.EnumerateArray())
+                    if (fileType == 2)
                     {
-                        string? cid = collEntry.TryGetProperty("publishedfileid", out var cidProp) ? cidProp.GetString() : null;
-                        bool isRoot = cid == Config.CollectionId;
-
-                        if (!collEntry.TryGetProperty("children", out var children))
+                        // Collection: enqueue each unvisited child.
+                        if (item.TryGetProperty("children", out var childrenArr) && childrenArr.ValueKind == JsonValueKind.Array)
                         {
-                            if (isRoot && !rootExpanded)
+                            foreach (var child in childrenArr.EnumerateArray())
                             {
-                                int resultObj = collEntry.TryGetProperty("result", out var resToken) ? resToken.GetInt32() : -1;
-                                throw new Exception($"Collection has no children or is inaccessible. Steam result code: {resultObj}. Check if the Steam API Key is valid and collection is public.");
+                                string? cid = child.TryGetProperty("publishedfileid", out var cidp) ? cidp.GetString() : null;
+                                if (string.IsNullOrEmpty(cid)) continue;
+                                if (visited.Add(cid))
+                                    pending.Enqueue(cid);
                             }
+                        }
+                    }
+                    else
+                    {
+                        // Workshop item (map).
+                        string? title = item.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
+                        if (string.IsNullOrEmpty(title))
+                        {
+                            Console.WriteLine($"[CS2SimpleVote] Item {id} returned without a title — skipping.");
                             continue;
                         }
-
-                        if (isRoot) rootExpanded = true;
-
-                        foreach (var child in children.EnumerateArray())
-                        {
-                            string? childId = child.TryGetProperty("publishedfileid", out var cidp) ? cidp.GetString() : null;
-                            if (string.IsNullOrEmpty(childId) || visited.Contains(childId)) continue;
-
-                            int fileType = child.TryGetProperty("filetype", out var ftProp) ? ftProp.GetInt32() : 0;
-                            if (fileType == 2)
-                            {
-                                visited.Add(childId);
-                                pendingCollections.Enqueue(childId);
-                            }
-                            else
-                            {
-                                // Treat as candidate workshop item; file_type from details will
-                                // reclassify as a collection if Steam mislabelled/omitted filetype.
-                                candidateItemIds.Add(childId);
-                            }
-                        }
+                        if (seenMaps.Add(id))
+                            maps.Add(new MapItem { Id = id, Name = title });
                     }
                 }
             }
 
-            await ExpandCollectionsAsync();
+            if (!rootResolved)
+                throw new Exception("Root collection was not returned by Steam API. Check Collection ID.");
 
-            var maps = new List<MapItem>();
-            var seenMapIds = new HashSet<string>();
-
-            async Task<List<string>> FetchDetailsAsync(List<string> ids)
-            {
-                var reclassifiedCollections = new List<string>();
-                if (ids.Count == 0) return reclassifiedCollections;
-
-                // Primary: legacy GetPublishedFileDetails (batched).
-                var itemPairs = new List<KeyValuePair<string, string>> {
-                    new("key", Config.SteamApiKey),
-                    new("itemcount", ids.Count.ToString())
-                };
-                for (int i = 0; i < ids.Count; i++) itemPairs.Add(new($"publishedfileids[{i}]", ids[i]));
-
-                var itemRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/", new FormUrlEncodedContent(itemPairs), token);
-                string itemJson = await itemRes.Content.ReadAsStringAsync(token);
-                using var itemDoc = JsonDocument.Parse(itemJson);
-
-                var failedIds = new List<string>();
-                if (itemDoc.RootElement.TryGetProperty("response", out var itemResp) && itemResp.TryGetProperty("publishedfiledetails", out var pubDetails))
-                {
-                    foreach (var item in pubDetails.EnumerateArray())
-                    {
-                        string? mapId = item.TryGetProperty("publishedfileid", out var idProp) ? idProp.GetString() : null;
-                        if (string.IsNullOrEmpty(mapId)) continue;
-
-                        int fileType = item.TryGetProperty("file_type", out var ftProp) ? ftProp.GetInt32() : 0;
-                        if (fileType == 2)
-                        {
-                            // Child was actually a collection — enqueue for expansion.
-                            if (visited.Add(mapId))
-                                reclassifiedCollections.Add(mapId);
-                            continue;
-                        }
-
-                        string? mapName = item.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
-                        if (string.IsNullOrEmpty(mapName))
-                        {
-                            failedIds.Add(mapId);
-                            continue;
-                        }
-
-                        if (seenMapIds.Add(mapId))
-                            maps.Add(new MapItem { Id = mapId, Name = mapName });
-                    }
-                }
-
-                // Fallback: modern IPublishedFileService/GetDetails for any items that came back empty.
-                if (failedIds.Count > 0)
-                {
-                    Console.WriteLine($"[CS2SimpleVote] Retrying {failedIds.Count} item(s) via IPublishedFileService/GetDetails...");
-                    try
-                    {
-                        var queryParts = new List<string> { $"key={Uri.EscapeDataString(Config.SteamApiKey)}" };
-                        for (int i = 0; i < failedIds.Count; i++)
-                            queryParts.Add($"publishedfileids%5B{i}%5D={failedIds[i]}");
-                        var retryUrl = $"https://api.steampowered.com/IPublishedFileService/GetDetails/v1/?{string.Join("&", queryParts)}";
-
-                        var retryRes = await _httpClient.GetAsync(retryUrl, token);
-                        string retryJson = await retryRes.Content.ReadAsStringAsync(token);
-                        using var retryDoc = JsonDocument.Parse(retryJson);
-
-                        if (retryDoc.RootElement.TryGetProperty("response", out var retryResp) && retryResp.TryGetProperty("publishedfiledetails", out var retryDetails))
-                        {
-                            foreach (var item in retryDetails.EnumerateArray())
-                            {
-                                string? mapId = item.TryGetProperty("publishedfileid", out var ridProp) ? ridProp.GetString() : null;
-                                if (string.IsNullOrEmpty(mapId)) continue;
-
-                                int fileType = item.TryGetProperty("file_type", out var rftProp) ? rftProp.GetInt32() : 0;
-                                if (fileType == 2)
-                                {
-                                    if (visited.Add(mapId))
-                                        reclassifiedCollections.Add(mapId);
-                                    continue;
-                                }
-
-                                string? mapName = item.TryGetProperty("title", out var rtitleProp) ? rtitleProp.GetString() : null;
-                                if (!string.IsNullOrEmpty(mapName))
-                                {
-                                    if (seenMapIds.Add(mapId))
-                                        maps.Add(new MapItem { Id = mapId, Name = mapName });
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"[CS2SimpleVote] Map ID {mapId} has no title on either API — item likely deleted or banned");
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception retryEx)
-                    {
-                        Console.WriteLine($"[CS2SimpleVote] Modern API retry failed: {retryEx.Message}");
-                    }
-                }
-
-                return reclassifiedCollections;
-            }
-
-            // Process items in batches; if any come back reclassified as collections, expand them
-            // and feed their children back through the item pipeline.
-            var toFetch = new List<string>(candidateItemIds);
-            while (toFetch.Count > 0)
-            {
-                var reclassified = new List<string>();
-                for (int i = 0; i < toFetch.Count; i += 100)
-                {
-                    var chunk = toFetch.GetRange(i, Math.Min(100, toFetch.Count - i));
-                    reclassified.AddRange(await FetchDetailsAsync(chunk));
-                }
-
-                toFetch.Clear();
-                if (reclassified.Count > 0)
-                {
-                    foreach (var cid in reclassified) pendingCollections.Enqueue(cid);
-                    int beforeCandidates = candidateItemIds.Count;
-                    await ExpandCollectionsAsync();
-                    // Any new candidates accumulated during expansion need to be fetched.
-                    foreach (var cid in candidateItemIds)
-                    {
-                        if (!seenMapIds.Contains(cid))
-                            toFetch.Add(cid);
-                    }
-                    // Avoid refetching IDs we've already resolved.
-                    toFetch.RemoveAll(id => seenMapIds.Contains(id));
-                    // Also remove IDs we've already attempted (tracked via seenMapIds after success,
-                    // but failed IDs may loop; break if no growth):
-                    if (candidateItemIds.Count == beforeCandidates && reclassified.Count == 0) break;
-                }
-            }
-
-            if (maps.Count == 0) throw new Exception("No maps could be loaded from collection.");
+            if (maps.Count == 0)
+                throw new Exception($"No maps resolved from collection {Config.CollectionId} (root result code: {rootResultCode}).");
 
             _availableMaps = maps;
             _hasLoadedCollectionMaps = true;
             _isApiLoading = false;
-            Console.WriteLine($"[CS2SimpleVote] Updated {_availableMaps.Count} maps from Steam (including nested collections).");
+            Console.WriteLine($"[CS2SimpleVote] Updated {_availableMaps.Count} maps from Steam (via IPublishedFileService, nested collections expanded).");
             SaveMapCache();
         }
-                catch (OperationCanceledException)
+        catch (OperationCanceledException)
         {
             _isApiLoading = false;
         }
