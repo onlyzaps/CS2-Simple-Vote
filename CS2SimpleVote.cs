@@ -101,10 +101,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private readonly Dictionary<int, List<MapItem>> _setnextmapPlayers = new();
     private readonly Dictionary<int, int> _playerSetNextMapPage = new();
 
-    // Logger
-    private BlockingCollection<string> _logQueue = new();
-    private Task? _logTask;
-    private string _logFilePath = "";
+    // Logger (lightweight, single-line, folder-per-day)
+    private string _logBaseDir = "";
+    private readonly object _logLock = new();
 
     // File Paths
     private string _historyFilePath = "";
@@ -151,9 +150,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         _historyFilePath = Path.Combine(configDir, "recent_maps.json");
         _cacheFilePath = Path.Combine(configDir, "map_cache.json");
-        _logFilePath = Path.Combine(configDir, "CS2SimpleVote_debug.log");
-        StartLogWriter();
-        LogRoutine(new { hotReload }, null);
+        _logBaseDir = Path.Combine(configDir, "logs");
+        try { Directory.CreateDirectory(_logBaseDir); } catch { /* non-fatal */ }
 
         // Clear existing memory state before loading
         _recentMaps.Clear();
@@ -210,6 +208,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             _nextMapSetByAdmin = true;
             _voteFinished = true;
 
+            Log("ADMIN", $"{PlayerTag(caller)} ran css_setnextmap -> {match.Name} ({match.Id})");
             cmdInfo.ReplyToCommand($"[CS2SimpleVote] Next map set to: {match.Name} (ID: {match.Id})");
             Server.PrintToChatAll($" {ColorDefault}The next map has been set to {ColorGreen}{match.Name}{ColorDefault}.");
         });
@@ -231,6 +230,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             var match = FindBestMapMatch(searchTerm);
             if (match == null) { cmdInfo.ReplyToCommand($"[CS2SimpleVote] No map found matching: {searchTerm}"); return; }
 
+            Log("ADMIN", $"{PlayerTag(caller)} ran css_forcemap -> {match.Name} ({match.Id})");
+            Log("MAPCHANGE", $"Forcing map change to {match.Name} ({match.Id})");
             cmdInfo.ReplyToCommand($"[CS2SimpleVote] Forcing map change to: {match.Name} (ID: {match.Id})");
             Server.PrintToChatAll($" {ColorDefault}Map is being changed to {ColorGreen}{match.Name}{ColorDefault}.");
             Server.ExecuteCommand($"host_workshop_map {match.Id}");
@@ -239,7 +240,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     public override void Unload(bool hotReload)
     {
-        LogRoutine(new { hotReload }, null);
         _unloaded = true;
 
         // 1. Cancel background tasks (FetchCollectionMaps) first
@@ -257,17 +257,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _mapChangeTimer?.Kill();
         _mapChangeTimer = null;
 
-        // 3. Complete the log queue so the log writer can drain and exit
-        try { _logQueue.CompleteAdding(); } catch (ObjectDisposedException) { }
-
-        // 4. Wait for the log writer task to finish (with timeout to avoid hanging)
-        if (_logTask != null)
-        {
-            try { _logTask.Wait(TimeSpan.FromSeconds(3)); } catch { /* timeout or cancelled, proceed */ }
-            _logTask = null;
-        }
-
-        // 5. Clear collections to release references
+        // 3. Clear collections to release references
         _availableMaps.Clear();
         _recentMaps.Clear();
         _rtvVoters.Clear();
@@ -303,16 +293,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _cts.Dispose();
         _cts = new CancellationTokenSource();
 
-        try { _logQueue.Dispose(); } catch { }
-        _logQueue = new BlockingCollection<string>();
-
         try { _httpClient.Dispose(); } catch { }
         _httpClient = new HttpClient();
     }
 
     private void OnMapStart(string mapName)
     {
-        LogRoutine(new { mapName }, null);
         ResetState();
         Server.ExecuteCommand("mp_endmatch_votenextmap 0");
 
@@ -335,7 +321,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void ResetState()
     {
-        LogRoutine(new { }, null);
         _matchEnded = false;
         _nextMapSetByAdmin = false;
         _voteInProgress = false;
@@ -448,7 +433,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void UpdateHistoryWithCurrentMap(string currentMapName)
     {
-        LogRoutine(new { currentMapName }, null);
         // Try to find the map by ID first (most reliable for workshop maps)
         var mapItem = _availableMaps.FirstOrDefault(m => !string.IsNullOrEmpty(m.Id) && currentMapName.Contains(m.Id, StringComparison.OrdinalIgnoreCase));
 
@@ -502,185 +486,231 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private async Task FetchCollectionMaps(CancellationToken token = default)
     {
-        LogRoutine(new { token }, null);
         if (string.IsNullOrEmpty(Config.SteamApiKey) || string.IsNullOrEmpty(Config.CollectionId)) return;
 
         try
         {
             _isApiLoading = true;
 
-            // Recursively resolve the root collection and any nested collections into a flat list of map IDs.
-            var mapFileIds = new List<string>();
-            var visitedCollections = new HashSet<string>();
+            // BFS: expand collections via GetCollectionDetails, accumulating candidate item IDs.
+            // We also re-verify every "map" candidate via GetPublishedFileDetails.file_type, because
+            // the `filetype` field inside GetCollectionDetails.children is sometimes absent or 0
+            // for items that are actually nested collections — and missing it means direct maps
+            // in the root collection get silently dropped when they share a response with a
+            // nested collection. Checking file_type from details is the authoritative signal.
             var pendingCollections = new Queue<string>();
-            var directMapIds = new HashSet<string>();
+            var visited = new HashSet<string>();
+            var candidateItemIds = new HashSet<string>();
             pendingCollections.Enqueue(Config.CollectionId);
+            visited.Add(Config.CollectionId);
+            bool rootExpanded = false;
 
-            while (pendingCollections.Count > 0)
+            async Task ExpandCollectionsAsync()
             {
-                // Batch up to ~100 collection IDs per call (Steam allows multiple collectioncount entries).
-                var batch = new List<string>();
-                while (pendingCollections.Count > 0 && batch.Count < 100)
+                while (pendingCollections.Count > 0)
                 {
-                    var cid = pendingCollections.Dequeue();
-                    if (visitedCollections.Add(cid)) batch.Add(cid);
-                }
-                if (batch.Count == 0) continue;
+                    var batch = new List<string>();
+                    while (pendingCollections.Count > 0 && batch.Count < 100)
+                        batch.Add(pendingCollections.Dequeue());
 
-                var collPairs = new List<KeyValuePair<string, string>> {
-                    new("key", Config.SteamApiKey),
-                    new("collectioncount", batch.Count.ToString())
-                };
-                for (int i = 0; i < batch.Count; i++)
-                    collPairs.Add(new($"publishedfileids[{i}]", batch[i]));
+                    var collPairs = new List<KeyValuePair<string, string>> {
+                        new("key", Config.SteamApiKey),
+                        new("collectioncount", batch.Count.ToString())
+                    };
+                    for (int i = 0; i < batch.Count; i++)
+                        collPairs.Add(new($"publishedfileids[{i}]", batch[i]));
 
-                var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", new FormUrlEncodedContent(collPairs), token);
-                string collJson = await collRes.Content.ReadAsStringAsync(token);
-                using var collDoc = JsonDocument.Parse(collJson);
+                    var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", new FormUrlEncodedContent(collPairs), token);
+                    string collJson = await collRes.Content.ReadAsStringAsync(token);
+                    using var collDoc = JsonDocument.Parse(collJson);
 
-                var rootResp = collDoc.RootElement.GetProperty("response");
-                if (!rootResp.TryGetProperty("collectiondetails", out var collDetails) || collDetails.GetArrayLength() == 0)
-                {
-                    if (batch.Contains(Config.CollectionId))
-                        throw new Exception("Invalid response or missing collection details from Steam API. Check Collection ID.");
-                    continue;
-                }
-
-                bool rootProcessed = false;
-                foreach (var collEntry in collDetails.EnumerateArray())
-                {
-                    string? cid = collEntry.TryGetProperty("publishedfileid", out var cidProp) ? cidProp.GetString() : null;
-                    bool isRoot = cid == Config.CollectionId;
-
-                    if (!collEntry.TryGetProperty("children", out var children))
+                    var rootResp = collDoc.RootElement.GetProperty("response");
+                    if (!rootResp.TryGetProperty("collectiondetails", out var collDetails) || collDetails.GetArrayLength() == 0)
                     {
-                        if (isRoot)
-                        {
-                            int resultObj = collEntry.TryGetProperty("result", out var resToken) ? resToken.GetInt32() : -1;
-                            throw new Exception($"Collection has no children or is inaccessible. Steam result code: {resultObj}. Check if the Steam API Key is valid and collection is public.");
-                        }
-                        // Nested entry that turned out not to be a collection (or empty) — skip.
+                        if (batch.Contains(Config.CollectionId))
+                            throw new Exception("Invalid response or missing collection details from Steam API. Check Collection ID.");
                         continue;
                     }
 
-                    if (isRoot) rootProcessed = true;
-
-                    foreach (var child in children.EnumerateArray())
+                    foreach (var collEntry in collDetails.EnumerateArray())
                     {
-                        string? childId = child.TryGetProperty("publishedfileid", out var cidp) ? cidp.GetString() : null;
-                        if (string.IsNullOrEmpty(childId)) continue;
+                        string? cid = collEntry.TryGetProperty("publishedfileid", out var cidProp) ? cidProp.GetString() : null;
+                        bool isRoot = cid == Config.CollectionId;
 
-                        int fileType = child.TryGetProperty("filetype", out var ftProp) ? ftProp.GetInt32() : 0;
+                        if (!collEntry.TryGetProperty("children", out var children))
+                        {
+                            if (isRoot && !rootExpanded)
+                            {
+                                int resultObj = collEntry.TryGetProperty("result", out var resToken) ? resToken.GetInt32() : -1;
+                                throw new Exception($"Collection has no children or is inaccessible. Steam result code: {resultObj}. Check if the Steam API Key is valid and collection is public.");
+                            }
+                            continue;
+                        }
+
+                        if (isRoot) rootExpanded = true;
+
+                        foreach (var child in children.EnumerateArray())
+                        {
+                            string? childId = child.TryGetProperty("publishedfileid", out var cidp) ? cidp.GetString() : null;
+                            if (string.IsNullOrEmpty(childId) || visited.Contains(childId)) continue;
+
+                            int fileType = child.TryGetProperty("filetype", out var ftProp) ? ftProp.GetInt32() : 0;
+                            if (fileType == 2)
+                            {
+                                visited.Add(childId);
+                                pendingCollections.Enqueue(childId);
+                            }
+                            else
+                            {
+                                // Treat as candidate workshop item; file_type from details will
+                                // reclassify as a collection if Steam mislabelled/omitted filetype.
+                                candidateItemIds.Add(childId);
+                            }
+                        }
+                    }
+                }
+            }
+
+            await ExpandCollectionsAsync();
+
+            var maps = new List<MapItem>();
+            var seenMapIds = new HashSet<string>();
+
+            async Task<List<string>> FetchDetailsAsync(List<string> ids)
+            {
+                var reclassifiedCollections = new List<string>();
+                if (ids.Count == 0) return reclassifiedCollections;
+
+                // Primary: legacy GetPublishedFileDetails (batched).
+                var itemPairs = new List<KeyValuePair<string, string>> {
+                    new("key", Config.SteamApiKey),
+                    new("itemcount", ids.Count.ToString())
+                };
+                for (int i = 0; i < ids.Count; i++) itemPairs.Add(new($"publishedfileids[{i}]", ids[i]));
+
+                var itemRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/", new FormUrlEncodedContent(itemPairs), token);
+                string itemJson = await itemRes.Content.ReadAsStringAsync(token);
+                using var itemDoc = JsonDocument.Parse(itemJson);
+
+                var failedIds = new List<string>();
+                if (itemDoc.RootElement.TryGetProperty("response", out var itemResp) && itemResp.TryGetProperty("publishedfiledetails", out var pubDetails))
+                {
+                    foreach (var item in pubDetails.EnumerateArray())
+                    {
+                        string? mapId = item.TryGetProperty("publishedfileid", out var idProp) ? idProp.GetString() : null;
+                        if (string.IsNullOrEmpty(mapId)) continue;
+
+                        int fileType = item.TryGetProperty("file_type", out var ftProp) ? ftProp.GetInt32() : 0;
                         if (fileType == 2)
                         {
-                            // Nested collection
-                            if (!visitedCollections.Contains(childId))
-                                pendingCollections.Enqueue(childId);
+                            // Child was actually a collection — enqueue for expansion.
+                            if (visited.Add(mapId))
+                                reclassifiedCollections.Add(mapId);
+                            continue;
                         }
-                        else
+
+                        string? mapName = item.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
+                        if (string.IsNullOrEmpty(mapName))
                         {
-                            // Workshop item (map)
-                            if (directMapIds.Add(childId))
-                                mapFileIds.Add(childId);
+                            failedIds.Add(mapId);
+                            continue;
                         }
+
+                        if (seenMapIds.Add(mapId))
+                            maps.Add(new MapItem { Id = mapId, Name = mapName });
                     }
                 }
 
-                if (batch.Contains(Config.CollectionId) && !rootProcessed)
+                // Fallback: modern IPublishedFileService/GetDetails for any items that came back empty.
+                if (failedIds.Count > 0)
                 {
-                    throw new Exception("Root collection not returned by Steam API. Check Collection ID.");
-                }
-            }
-
-            var fileIds = mapFileIds;
-            if (fileIds.Count == 0) throw new Exception("No files found in collection.");
-
-            var itemPairs = new List<KeyValuePair<string, string>> { 
-                new("key", Config.SteamApiKey),
-                new("itemcount", fileIds.Count.ToString()) 
-            };
-            for (int i = 0; i < fileIds.Count; i++) itemPairs.Add(new($"publishedfileids[{i}]", fileIds[i]));
-
-            var itemRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/", new FormUrlEncodedContent(itemPairs), token);
-            string itemJson = await itemRes.Content.ReadAsStringAsync(token);
-            using var itemDoc = JsonDocument.Parse(itemJson);
-
-            var newMapList = new List<MapItem>();
-            var failedIds = new List<string>();
-            if (itemDoc.RootElement.TryGetProperty("response", out var itemResp) && itemResp.TryGetProperty("publishedfiledetails", out var pubDetails))
-            {
-                foreach (var item in pubDetails.EnumerateArray())
-                {
-                    string? mapId = item.TryGetProperty("publishedfileid", out var idProp) ? idProp.GetString() : null;
-                    string? mapName = item.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
-
-                    if (string.IsNullOrEmpty(mapId))
+                    Console.WriteLine($"[CS2SimpleVote] Retrying {failedIds.Count} item(s) via IPublishedFileService/GetDetails...");
+                    try
                     {
-                        Console.WriteLine($"[CS2SimpleVote] Skipped collection item: missing publishedfileid");
-                        continue;
-                    }
+                        var queryParts = new List<string> { $"key={Uri.EscapeDataString(Config.SteamApiKey)}" };
+                        for (int i = 0; i < failedIds.Count; i++)
+                            queryParts.Add($"publishedfileids%5B{i}%5D={failedIds[i]}");
+                        var retryUrl = $"https://api.steampowered.com/IPublishedFileService/GetDetails/v1/?{string.Join("&", queryParts)}";
 
-                    if (string.IsNullOrEmpty(mapName))
-                    {
-                        int result = item.TryGetProperty("result", out var resProp) ? resProp.GetInt32() : -1;
-                        Console.WriteLine($"[CS2SimpleVote] Map ID {mapId} failed on legacy API (result code: {result}), will retry with modern API...");
-                        failedIds.Add(mapId);
-                        continue;
-                    }
+                        var retryRes = await _httpClient.GetAsync(retryUrl, token);
+                        string retryJson = await retryRes.Content.ReadAsStringAsync(token);
+                        using var retryDoc = JsonDocument.Parse(retryJson);
 
-                    newMapList.Add(new MapItem { Id = mapId, Name = mapName });
-                }
-            }
-
-            // Retry failed items using the modern IPublishedFileService endpoint
-            if (failedIds.Count > 0)
-            {
-                Console.WriteLine($"[CS2SimpleVote] Retrying {failedIds.Count} item(s) via IPublishedFileService/GetDetails...");
-                try
-                {
-                    var queryParts = new List<string> { $"key={Uri.EscapeDataString(Config.SteamApiKey)}" };
-                    for (int i = 0; i < failedIds.Count; i++)
-                        queryParts.Add($"publishedfileids%5B{i}%5D={failedIds[i]}");
-                    var retryUrl = $"https://api.steampowered.com/IPublishedFileService/GetDetails/v1/?{string.Join("&", queryParts)}";
-
-                    var retryRes = await _httpClient.GetAsync(retryUrl, token);
-                    string retryJson = await retryRes.Content.ReadAsStringAsync(token);
-                    using var retryDoc = JsonDocument.Parse(retryJson);
-
-                    if (retryDoc.RootElement.TryGetProperty("response", out var retryResp) && retryResp.TryGetProperty("publishedfiledetails", out var retryDetails))
-                    {
-                        foreach (var item in retryDetails.EnumerateArray())
+                        if (retryDoc.RootElement.TryGetProperty("response", out var retryResp) && retryResp.TryGetProperty("publishedfiledetails", out var retryDetails))
                         {
-                            string? mapId = item.TryGetProperty("publishedfileid", out var ridProp) ? ridProp.GetString() : null;
-                            string? mapName = item.TryGetProperty("title", out var rtitleProp) ? rtitleProp.GetString() : null;
+                            foreach (var item in retryDetails.EnumerateArray())
+                            {
+                                string? mapId = item.TryGetProperty("publishedfileid", out var ridProp) ? ridProp.GetString() : null;
+                                if (string.IsNullOrEmpty(mapId)) continue;
 
-                            if (!string.IsNullOrEmpty(mapId) && !string.IsNullOrEmpty(mapName))
-                            {
-                                Console.WriteLine($"[CS2SimpleVote] Recovered map via modern API: {mapName} (ID: {mapId})");
-                                newMapList.Add(new MapItem { Id = mapId, Name = mapName });
-                            }
-                            else if (!string.IsNullOrEmpty(mapId))
-                            {
-                                Console.WriteLine($"[CS2SimpleVote] Map ID {mapId} also failed on modern API — item is likely deleted or banned");
+                                int fileType = item.TryGetProperty("file_type", out var rftProp) ? rftProp.GetInt32() : 0;
+                                if (fileType == 2)
+                                {
+                                    if (visited.Add(mapId))
+                                        reclassifiedCollections.Add(mapId);
+                                    continue;
+                                }
+
+                                string? mapName = item.TryGetProperty("title", out var rtitleProp) ? rtitleProp.GetString() : null;
+                                if (!string.IsNullOrEmpty(mapName))
+                                {
+                                    if (seenMapIds.Add(mapId))
+                                        maps.Add(new MapItem { Id = mapId, Name = mapName });
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"[CS2SimpleVote] Map ID {mapId} has no title on either API — item likely deleted or banned");
+                                }
                             }
                         }
                     }
+                    catch (Exception retryEx)
+                    {
+                        Console.WriteLine($"[CS2SimpleVote] Modern API retry failed: {retryEx.Message}");
+                    }
                 }
-                catch (Exception retryEx)
-                {
-                    Console.WriteLine($"[CS2SimpleVote] Modern API retry failed: {retryEx.Message}");
-                }
+
+                return reclassifiedCollections;
             }
 
-            if (newMapList.Count < fileIds.Count)
+            // Process items in batches; if any come back reclassified as collections, expand them
+            // and feed their children back through the item pipeline.
+            var toFetch = new List<string>(candidateItemIds);
+            while (toFetch.Count > 0)
             {
-                Console.WriteLine($"[CS2SimpleVote] WARNING: {fileIds.Count - newMapList.Count} of {fileIds.Count} collection items could not be loaded");
+                var reclassified = new List<string>();
+                for (int i = 0; i < toFetch.Count; i += 100)
+                {
+                    var chunk = toFetch.GetRange(i, Math.Min(100, toFetch.Count - i));
+                    reclassified.AddRange(await FetchDetailsAsync(chunk));
+                }
+
+                toFetch.Clear();
+                if (reclassified.Count > 0)
+                {
+                    foreach (var cid in reclassified) pendingCollections.Enqueue(cid);
+                    int beforeCandidates = candidateItemIds.Count;
+                    await ExpandCollectionsAsync();
+                    // Any new candidates accumulated during expansion need to be fetched.
+                    foreach (var cid in candidateItemIds)
+                    {
+                        if (!seenMapIds.Contains(cid))
+                            toFetch.Add(cid);
+                    }
+                    // Avoid refetching IDs we've already resolved.
+                    toFetch.RemoveAll(id => seenMapIds.Contains(id));
+                    // Also remove IDs we've already attempted (tracked via seenMapIds after success,
+                    // but failed IDs may loop; break if no growth):
+                    if (candidateItemIds.Count == beforeCandidates && reclassified.Count == 0) break;
+                }
             }
 
-            _availableMaps = newMapList;
+            if (maps.Count == 0) throw new Exception("No maps could be loaded from collection.");
+
+            _availableMaps = maps;
             _hasLoadedCollectionMaps = true;
             _isApiLoading = false;
-            Console.WriteLine($"[CS2SimpleVote] Updated {_availableMaps.Count} maps from Steam.");
+            Console.WriteLine($"[CS2SimpleVote] Updated {_availableMaps.Count} maps from Steam (including nested collections).");
             SaveMapCache();
         }
                 catch (OperationCanceledException)
@@ -738,7 +768,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult OnPlayerChat(CCSPlayerController? player, CommandInfo info)
     {
-        LogRoutine(new { player, info }, null);
         if (_unloaded) return HookResult.Continue;
         if (!IsValidPlayer(player)) return HookResult.Continue;
         var p = player!;
@@ -792,7 +821,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- Logic ---
     private void AttemptRevote(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         if (!_voteInProgress) { player!.PrintToChat($" {ColorDefault}There is no vote currently in progress."); return; }
         player!.PrintToChat($" {ColorDefault}Redisplaying vote options. You may recast your vote.");
@@ -898,7 +926,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintHelp(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
         bool isAdmin = Config.Admins.Contains(p.SteamID);
@@ -927,7 +954,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintNominationList(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         if (_nominatedMaps.Count == 0) { player!.PrintToChat($" {ColorDefault}No maps currently nominated."); return; }
 
@@ -942,14 +968,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintNextMap(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (string.IsNullOrEmpty(_nextMapName)) { if (IsValidPlayer(player)) player!.PrintToChat($" {ColorDefault}The next map has not been decided yet."); return; }
         Server.PrintToChatAll($" {ColorDefault}The next map will be: {ColorGreen}{_nextMapName}");
     }
 
     private void PrintLastMap(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (_recentMaps.Count > 1) 
         {
             // The current map is usually pushed to the end of _recentMaps upon OnMapStart.
@@ -965,7 +989,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintRecentMaps(CCSPlayerController? player, string? arg = null)
     {
-        LogRoutine(new { player, arg }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
@@ -1015,7 +1038,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void AttemptRtv(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
         if (IsWarmup()) { p.PrintToChat($" {ColorDefault}RTV is disabled during warmup."); return; }
@@ -1025,14 +1047,14 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         int currentPlayers = GetHumanPlayers().Count();
         int votesNeeded = (int)Math.Ceiling(currentPlayers * Config.RtvPercentage);
+        Log("RTV", $"{PlayerTag(p)} rocked the vote ({_rtvVoters.Count}/{votesNeeded})");
         Server.PrintToChatAll($" {ColorDefault}{ColorGreen}{p.PlayerName}{ColorDefault} wants to change the map! ({_rtvVoters.Count}/{votesNeeded})");
 
-        if (_rtvVoters.Count >= votesNeeded) { Server.PrintToChatAll($" {ColorDefault}RTV Threshold reached! Starting vote..."); StartMapVote(isRtv: true); }
+        if (_rtvVoters.Count >= votesNeeded) { Log("RTV", $"Threshold reached ({_rtvVoters.Count}/{votesNeeded}) — starting vote"); Server.PrintToChatAll($" {ColorDefault}RTV Threshold reached! Starting vote..."); StartMapVote(isRtv: true); }
     }
 
     private void AttemptNominate(CCSPlayerController? player, string? searchTerm = null)
     {
-        LogRoutine(new { player, searchTerm }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
         if (!Config.EnableNominate) { p.PrintToChat($" {ColorDefault}Nominations are currently disabled."); return; }
@@ -1094,7 +1116,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult HandleNominationInput(CCSPlayerController player, string input)
     {
-        LogRoutine(new { player, input }, null);
         if (input.Equals("cancel", StringComparison.OrdinalIgnoreCase)) { CloseNominationMenu(player); player.PrintToChat($" {ColorDefault}Nomination cancelled."); return HookResult.Handled; }
         if (input == "0") { _playerNominationPage[player.Slot]++; DisplayNominationMenu(player); return HookResult.Handled; }
         if (int.TryParse(input, out int selection))
@@ -1119,7 +1140,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void ProcessNomination(CCSPlayerController player, MapItem map)
     {
-        LogRoutine(new { player, map }, null);
         _nominationNames[player.SteamID] = player.PlayerName;
         if (_hasNominatedSteamIds.Contains(player.SteamID))
         {
@@ -1129,6 +1149,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             }
             _nominatedMaps.Add(map);
             _nominationOwner[player.SteamID] = map;
+            Log("NOMINATE", $"{PlayerTag(player)} changed nomination to {map.Name} ({map.Id})");
             Server.PrintToChatAll($" {ColorDefault}Player {ColorGreen}{player.PlayerName}{ColorDefault} changed their nomination to {ColorGreen}{map.Name}{ColorDefault}.");
         }
         else
@@ -1136,6 +1157,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             _nominatedMaps.Add(map);
             _hasNominatedSteamIds.Add(player.SteamID);
             _nominationOwner[player.SteamID] = map;
+            Log("NOMINATE", $"{PlayerTag(player)} nominated {map.Name} ({map.Id})");
             Server.PrintToChatAll($" {ColorDefault}Player {ColorGreen}{player.PlayerName}{ColorDefault} nominated {ColorGreen}{map.Name}{ColorDefault}.");
         }
     }
@@ -1145,7 +1167,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- Forcemap Logic ---
     private void AttemptForcemap(CCSPlayerController? player, string? searchTerm = null)
     {
-        LogRoutine(new { player, searchTerm }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
@@ -1172,6 +1193,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (validMaps.Count == 1 && !string.IsNullOrEmpty(searchTerm))
         {
             var map = validMaps[0];
+            Log("ADMIN", $"{PlayerTag(p)} ran !forcemap '{searchTerm}' -> {map.Name} ({map.Id})");
+            Log("MAPCHANGE", $"Forcing map change to {map.Name} ({map.Id}) by {PlayerTag(p)}");
             Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} forced map change to {ColorGreen}{map.Name}{ColorDefault}.");
             Server.ExecuteCommand($"host_workshop_map {map.Id}");
             return;
@@ -1199,7 +1222,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult HandleForcemapInput(CCSPlayerController player, string input)
     {
-        LogRoutine(new { player, input }, null);
         if (input.Equals("cancel", StringComparison.OrdinalIgnoreCase)) { CloseForcemapMenu(player); player.PrintToChat($" {ColorDefault}Forcemap cancelled."); return HookResult.Handled; }
         if (input == "0") { _playerForcemapPage[player.Slot]++; DisplayForcemapMenu(player); return HookResult.Handled; }
         if (int.TryParse(input, out int selection))
@@ -1210,6 +1232,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             if (realIndex >= 0 && realIndex < maps.Count && realIndex >= (page * Config.NominatePerPage) && realIndex < ((page + 1) * Config.NominatePerPage))
             {
                 var selectedMap = maps[realIndex];
+                Log("ADMIN", $"{PlayerTag(player)} selected forcemap -> {selectedMap.Name} ({selectedMap.Id})");
+                Log("MAPCHANGE", $"Forcing map change to {selectedMap.Name} ({selectedMap.Id}) by {PlayerTag(player)}");
                 Server.PrintToChatAll($" {ColorDefault} Admin {ColorGreen}{player.PlayerName}{ColorDefault} forced map change to {ColorGreen}{selectedMap.Name}{ColorDefault}.");
                 Server.ExecuteCommand($"host_workshop_map {selectedMap.Id}");
                 CloseForcemapMenu(player);
@@ -1223,7 +1247,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- SetNextMap Logic ---
     private void AttemptSetNextMap(CCSPlayerController? player, string? searchTerm = null)
     {
-        LogRoutine(new { player, searchTerm }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
@@ -1274,7 +1297,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult HandleSetNextMapInput(CCSPlayerController player, string input)
     {
-        LogRoutine(new { player, input }, null);
         if (input.Equals("cancel", StringComparison.OrdinalIgnoreCase)) { CloseSetNextMapMenu(player); player.PrintToChat($" {ColorDefault}SetNextMap cancelled."); return HookResult.Handled; }
         if (input == "0") { _playerSetNextMapPage[player.Slot]++; DisplaySetNextMapMenu(player); return HookResult.Handled; }
         if (int.TryParse(input, out int selection))
@@ -1294,12 +1316,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void ProcessSetNextMap(CCSPlayerController player, MapItem selectedMap)
     {
-        LogRoutine(new { player, selectedMap }, null);
         _pendingMapId = selectedMap.Id;
         _nextMapName = selectedMap.Name;
         _nextMapSetByAdmin = true;
         _voteFinished = true;
-        
+        Log("ADMIN", $"{PlayerTag(player)} ran !setnextmap -> {selectedMap.Name} ({selectedMap.Id})");
+
         string rawMsg = $"{player.PlayerName} has set the next map to {selectedMap.Name}.";
         string dashes = new string('-', rawMsg.Length);
 
@@ -1313,7 +1335,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- FinishVote Logic ---
     private void AttemptFinishVote(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
@@ -1329,6 +1350,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return;
         }
 
+        Log("ADMIN", $"{PlayerTag(p)} ran !finishvote");
         Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} ended the vote early.");
         EndVote();
     }
@@ -1336,7 +1358,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- EndWarmup Logic ---
     private void AttemptEndWarmup(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
@@ -1352,6 +1373,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return;
         }
 
+        Log("ADMIN", $"{PlayerTag(p)} ran !endwarmup");
         Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} ended the warmup.");
         Server.ExecuteCommand("mp_warmup_end");
     }
@@ -1359,7 +1381,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- ForceVote Logic ---
     private void AttemptForceVote(CCSPlayerController? player)
     {
-        LogRoutine(new { player }, null);
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
@@ -1387,13 +1408,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return;
         }
 
+        Log("ADMIN", $"{PlayerTag(p)} ran !forcevote");
         Server.PrintToChatAll($" {ColorDefault} Admin {ColorGreen}{p.PlayerName}{ColorDefault} initiated a map vote.");
         StartMapVote(isRtv: false, isForceVote: true);
     }
 
     private void StartMapVote(bool isRtv, bool isForceVote = false)
     {
-        LogRoutine(new { isRtv, isForceVote }, null);
         // 1. If force vote happening AFTER a finished vote, we must backup the result
         if (isForceVote && _voteFinished)
         {
@@ -1500,14 +1521,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult HandleVoteInput(CCSPlayerController player, string input)
     {
-        LogRoutine(new { player, input }, null);
-        if (int.TryParse(input, out int option) && _activeVoteOptions.ContainsKey(option)) { _playerVotes[player.Slot] = option; player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{GetMapName(_activeVoteOptions[option])}{ColorDefault}"); return HookResult.Handled; }
+        if (int.TryParse(input, out int option) && _activeVoteOptions.ContainsKey(option)) { _playerVotes[player.Slot] = option; string votedMapId = _activeVoteOptions[option]; string votedMapName = GetMapName(votedMapId); Log("VOTE", $"{PlayerTag(player)} voted for option {option}: {votedMapName} ({votedMapId})"); player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{votedMapName}{ColorDefault}"); return HookResult.Handled; }
         return HookResult.Continue;
     }
 
     private void EndVote()
     {
-        LogRoutine(new { }, null);
         if (!_voteInProgress) return;
         _voteInProgress = false; _voteFinished = true; _reminderTimer?.Kill(); _reminderTimer = null;
         _centerMessageTimer?.Kill(); _centerMessageTimer = null;
@@ -1549,6 +1568,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         string rawMsg = $"Winner: {_nextMapName}" + (voteCount > 0 ? $" with {voteCount} votes!" : " (Random/Previous)");
         string dashes = new string('-', rawMsg.Length);
 
+        Log("WINNER", $"Selected {_nextMapName} ({winningMapId}) with {voteCount} vote(s); total votes cast: {_playerVotes.Count}");
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
         Server.PrintToChatAll($" {ColorDefault}Winner: {ColorGreen}{_nextMapName}{ColorDefault}" + (voteCount > 0 ? $" with {ColorGreen}{voteCount}{ColorDefault} votes!" : " (Random/Previous)"));
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
@@ -1596,7 +1616,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintVoteProgress()
     {
-        LogRoutine(new { }, null);
         if (_playerVotes.Count == 0) return;
 
         var voteCounts = _playerVotes.Values
@@ -1618,7 +1637,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
         if (_unloaded) return HookResult.Continue;
-        LogRoutine(new { @event, info }, null);
         if (_voteFinished || _voteInProgress || _nextMapSetByAdmin) return HookResult.Continue;
         try
         {
@@ -1632,7 +1650,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
     {
         if (_unloaded) return HookResult.Continue;
-        LogRoutine(new { @event, info }, null);
         if (_voteInProgress && _isScheduledVote)
         {
             _currentVoteRoundDuration++;
@@ -1663,7 +1680,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
     private HookResult OnMatchEnd(EventCsWinPanelMatch @event, GameEventInfo info)
     {
-        LogRoutine(new { @event, info }, null);
         _matchEnded = true;
 
         if (_voteInProgress)
@@ -1675,6 +1691,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             string mapIdToChange = _pendingMapId;
             string mapNameToChange = GetMapName(mapIdToChange);
+            Log("MAPCHANGE", $"End-of-match map change scheduled to {mapNameToChange} ({mapIdToChange})");
             Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{mapNameToChange}{ColorDefault}!");
             _mapChangeTimer = AddTimer(5.0f, () =>
             {
@@ -1687,76 +1704,31 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
     private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
     {
-        LogRoutine(new { player = @event.Userid?.PlayerName }, null);
         if (@event.Userid is { } player) { _rtvVoters.Remove(player.Slot); _playerVotes.Remove(player.Slot); CloseNominationMenu(player); CloseForcemapMenu(player); CloseSetNextMapMenu(player); } return HookResult.Continue; }
 
     // --- Logging Infrastructure ---
-    private void StartLogWriter()
+    // Lightweight per-day event log. Only explicitly invoked for: map votes cast by players,
+    // RTVs, nominations, admin commands, map changes, and winning-map selections.
+    private void Log(string category, string message)
     {
-        var token = _cts.Token;
-        _logTask = Task.Run(() => 
+        if (_unloaded || string.IsNullOrEmpty(_logBaseDir)) return;
+        try
         {
-            try 
+            var now = DateTime.Now;
+            string dayDir = Path.Combine(_logBaseDir, now.ToString("yyyy-MM-dd"));
+            Directory.CreateDirectory(dayDir);
+            string path = Path.Combine(dayDir, "events.log");
+            string line = $"[{now:HH:mm:ss}] {category} | {message}{Environment.NewLine}";
+            lock (_logLock)
             {
-                using var fs = new FileStream(_logFilePath, FileMode.Append, FileAccess.Write, FileShare.Read | FileShare.Write);
-                using var writer = new StreamWriter(fs, Encoding.UTF8) { AutoFlush = true };
-                foreach (var logContent in _logQueue.GetConsumingEnumerable())
-                {
-                    try { writer.WriteLine(logContent); }
-                    catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Log write error: {ex.Message}"); }
-                }
-            } 
-            catch (OperationCanceledException) { }
-            catch (Exception ex) 
-            {
-                Console.WriteLine($"[CS2SimpleVote] Logger failed: {ex.Message}");
+                File.AppendAllText(path, line, Encoding.UTF8);
             }
-        }, token);
+        }
+        catch { /* logging must never crash the plugin */ }
     }
 
-    private void LogRoutine(object? inputs = null, object? outputs = null, [System.Runtime.CompilerServices.CallerMemberName] string routine = "")
-    {
-        if (_unloaded) return;
-        
-        string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
-        var sb = new StringBuilder();
-        sb.AppendLine("================================================================================");
-        sb.AppendLine($"[{timestamp}] -> ROUTINE: {routine}");
-        sb.AppendLine("================================================================================");
-        
-        if (inputs != null)
-        {
-            sb.AppendLine("  INPUTS  : ");
-            try 
-            { 
-                string json = JsonSerializer.Serialize(inputs, new JsonSerializerOptions { WriteIndented = true });
-                foreach(var line in json.Split('\n')) sb.AppendLine("    " + line.TrimEnd('\r'));
-            }
-            catch { sb.AppendLine("    " + inputs.ToString()); }
-        }
-        else
-        {
-            sb.AppendLine("  INPUTS  : None");
-        }
-        
-        if (outputs != null)
-        {
-            sb.AppendLine("  OUTPUTS : ");
-            try 
-            { 
-                string json = JsonSerializer.Serialize(outputs, new JsonSerializerOptions { WriteIndented = true });
-                foreach(var line in json.Split('\n')) sb.AppendLine("    " + line.TrimEnd('\r'));
-            }
-            catch { sb.AppendLine("    " + outputs.ToString()); }
-        }
-        else
-        {
-            sb.AppendLine("  OUTPUTS : None");
-        }
-        sb.AppendLine("--------------------------------------------------------------------------------");
-        
-        try { _logQueue.Add(sb.ToString()); } catch { /* Queue might be closed */ }
-    }
+    private static string PlayerTag(CCSPlayerController? p)
+        => p == null ? "unknown" : $"{p.PlayerName} ({p.SteamID})";
 }
 
 
