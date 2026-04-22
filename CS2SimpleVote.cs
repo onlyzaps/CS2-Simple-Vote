@@ -508,35 +508,91 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         try
         {
             _isApiLoading = true;
-            var collContent = new FormUrlEncodedContent(new[] {
-                new KeyValuePair<string, string>("key", Config.SteamApiKey),
-                new KeyValuePair<string, string>("collectioncount", "1"),
-                new KeyValuePair<string, string>("publishedfileids[0]", Config.CollectionId)
-            });
 
-            var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", collContent, token);
-            string collJson = await collRes.Content.ReadAsStringAsync(token);
-            using var collDoc = JsonDocument.Parse(collJson);
+            // Recursively resolve the root collection and any nested collections into a flat list of map IDs.
+            var mapFileIds = new List<string>();
+            var visitedCollections = new HashSet<string>();
+            var pendingCollections = new Queue<string>();
+            var directMapIds = new HashSet<string>();
+            pendingCollections.Enqueue(Config.CollectionId);
 
-            var rootResp = collDoc.RootElement.GetProperty("response");
-            if (!rootResp.TryGetProperty("collectiondetails", out var collDetails) || collDetails.GetArrayLength() == 0)
+            while (pendingCollections.Count > 0)
             {
-                throw new Exception("Invalid response or missing collection details from Steam API. Check Collection ID.");
+                // Batch up to ~100 collection IDs per call (Steam allows multiple collectioncount entries).
+                var batch = new List<string>();
+                while (pendingCollections.Count > 0 && batch.Count < 100)
+                {
+                    var cid = pendingCollections.Dequeue();
+                    if (visitedCollections.Add(cid)) batch.Add(cid);
+                }
+                if (batch.Count == 0) continue;
+
+                var collPairs = new List<KeyValuePair<string, string>> {
+                    new("key", Config.SteamApiKey),
+                    new("collectioncount", batch.Count.ToString())
+                };
+                for (int i = 0; i < batch.Count; i++)
+                    collPairs.Add(new($"publishedfileids[{i}]", batch[i]));
+
+                var collRes = await _httpClient.PostAsync("https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/", new FormUrlEncodedContent(collPairs), token);
+                string collJson = await collRes.Content.ReadAsStringAsync(token);
+                using var collDoc = JsonDocument.Parse(collJson);
+
+                var rootResp = collDoc.RootElement.GetProperty("response");
+                if (!rootResp.TryGetProperty("collectiondetails", out var collDetails) || collDetails.GetArrayLength() == 0)
+                {
+                    if (batch.Contains(Config.CollectionId))
+                        throw new Exception("Invalid response or missing collection details from Steam API. Check Collection ID.");
+                    continue;
+                }
+
+                bool rootProcessed = false;
+                foreach (var collEntry in collDetails.EnumerateArray())
+                {
+                    string? cid = collEntry.TryGetProperty("publishedfileid", out var cidProp) ? cidProp.GetString() : null;
+                    bool isRoot = cid == Config.CollectionId;
+
+                    if (!collEntry.TryGetProperty("children", out var children))
+                    {
+                        if (isRoot)
+                        {
+                            int resultObj = collEntry.TryGetProperty("result", out var resToken) ? resToken.GetInt32() : -1;
+                            throw new Exception($"Collection has no children or is inaccessible. Steam result code: {resultObj}. Check if the Steam API Key is valid and collection is public.");
+                        }
+                        // Nested entry that turned out not to be a collection (or empty) — skip.
+                        continue;
+                    }
+
+                    if (isRoot) rootProcessed = true;
+
+                    foreach (var child in children.EnumerateArray())
+                    {
+                        string? childId = child.TryGetProperty("publishedfileid", out var cidp) ? cidp.GetString() : null;
+                        if (string.IsNullOrEmpty(childId)) continue;
+
+                        int fileType = child.TryGetProperty("filetype", out var ftProp) ? ftProp.GetInt32() : 0;
+                        if (fileType == 2)
+                        {
+                            // Nested collection
+                            if (!visitedCollections.Contains(childId))
+                                pendingCollections.Enqueue(childId);
+                        }
+                        else
+                        {
+                            // Workshop item (map)
+                            if (directMapIds.Add(childId))
+                                mapFileIds.Add(childId);
+                        }
+                    }
+                }
+
+                if (batch.Contains(Config.CollectionId) && !rootProcessed)
+                {
+                    throw new Exception("Root collection not returned by Steam API. Check Collection ID.");
+                }
             }
 
-            var firstColl = collDetails[0];
-            if (!firstColl.TryGetProperty("children", out var children))
-            {
-                int resultObj = firstColl.TryGetProperty("result", out var resToken) ? resToken.GetInt32() : -1;
-                throw new Exception($"Collection has no children or is inaccessible. Steam result code: {resultObj}. Check if the Steam API Key is valid and collection is public.");
-            }
-
-            var fileIds = children.EnumerateArray()
-                .Select(c => c.GetProperty("publishedfileid").GetString())
-                .Where(id => !string.IsNullOrEmpty(id))
-                .Cast<string>()
-                .ToList();
-
+            var fileIds = mapFileIds;
             if (fileIds.Count == 0) throw new Exception("No files found in collection.");
 
             var itemPairs = new List<KeyValuePair<string, string>> { 
