@@ -1,9 +1,6 @@
 name: Compile and Release CS2SimpleVote
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
