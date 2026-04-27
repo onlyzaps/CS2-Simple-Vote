@@ -1,6 +1,7 @@
 # CS2SimpleVote
 
 ```NOW SUPPORTS NESTED COLLECTIONS! RTV IS NOW FIXED!```
+https://buymeacoffee.com/theboneman
 
 A lightweight, robust, and feature-rich map voting plugin for Counter-Strike 2, built on the **CounterStrikeSharp** framework. It provides a seamless experience for players to nominate and vote for the next map from a Steam Workshop collection, with powerful administrative controls.
 
