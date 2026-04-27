@@ -42,6 +42,7 @@ The configuration file is generated at `.../configs/plugins/CS2SimpleVote/CS2Sim
 | `enable_rtv` | `bool` | `true` | Enables or disables the `!rtv` command. |
 | `rtv_percentage` | `float` | `0.60` | The percentage of human players required to trigger an RTV (0.0 - 1.0). |
 | `rtv_change_delay` | `float` | `5.0` | Seconds to wait before switching maps after a successful RTV. |
+| `postmap_change_delay` | `float` | `10.0` | Seconds to wait before switching maps at end-of-match (scheduled and force votes). Clamped to a maximum of 15 seconds. |
 | `enable_nominate` | `bool` | `true` | Enables or disables the `!nominate` command. |
 | `nominate_per_page` | `int` | `6` | Number of maps to display per page in selection menus. |
 | `vote_options_count` | `int` | `8` | Total number of maps that appear in a single vote (max 10). |
@@ -127,7 +128,7 @@ Last 5 Recent Maps
 5. de_vertigo
 ```
 
-### `!maplist`
+### `!maplist` / `!maps`
 Prints the full alphabetical list of every map loaded from the Workshop collection (including maps pulled in from nested collections) to your personal client console. A chat message confirms how many maps were sent. Open the console with `~` to view the list.
 ```text
 All 42 maps were sent to your console. Press ~ to view.

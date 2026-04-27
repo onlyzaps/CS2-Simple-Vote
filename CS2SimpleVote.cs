@@ -24,6 +24,7 @@ public class VoteConfig : BasePluginConfig
     [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 6;
     [JsonPropertyName("rtv_percentage")] public float RtvPercentage { get; set; } = 0.60f;
     [JsonPropertyName("rtv_change_delay")] public float RtvDelaySeconds { get; set; } = 5.0f;
+    [JsonPropertyName("postmap_change_delay")] public float PostMapChangeDelay { get; set; } = 10.0f;
     [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 8;
     [JsonPropertyName("vote_reminder_enabled")] public bool EnableReminders { get; set; } = true;
     [JsonPropertyName("vote_reminder_interval")] public float ReminderIntervalSeconds { get; set; } = 30.0f;
@@ -689,7 +690,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (cmd.Equals("nextmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNextMap(p)); return HookResult.Continue; }
         if (cmd.Equals("lastmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintLastMap(p)); return HookResult.Continue; }
         if (cmd.Equals("recentmaps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintRecentMaps(p, args)); return HookResult.Continue; }
-        if (cmd.Equals("maplist", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintMapListToConsole(p)); return HookResult.Continue; }
+        if (cmd.Equals("maplist", StringComparison.OrdinalIgnoreCase) || cmd.Equals("maps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintMapListToConsole(p)); return HookResult.Continue; }
 
         if (cmd.Equals("nominate", StringComparison.OrdinalIgnoreCase) || cmd.Equals("nom", StringComparison.OrdinalIgnoreCase))
         {
@@ -840,7 +841,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         p.PrintToChat($" {ColorGreen}!help {ColorDefault}- List available commands");
         p.PrintToChat($" {ColorGreen}!lastmap {ColorDefault}- Show last played map");
-        p.PrintToChat($" {ColorGreen}!maplist {ColorDefault}- Print the full map list to your console");
+        p.PrintToChat($" {ColorGreen}!maplist {ColorDefault}/ {ColorGreen}!maps {ColorDefault}- Print the full map list to your console");
         p.PrintToChat($" {ColorGreen}!nextmap {ColorDefault}- Show next map");
         p.PrintToChat($" {ColorGreen}!nominate [name] {ColorDefault}- Nominate a map");
         p.PrintToChat($" {ColorGreen}!nominatelist {ColorDefault}- List nominated maps");
@@ -1611,7 +1612,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             string mapNameToChange = GetMapName(mapIdToChange);
             Log("MAPCHANGE", $"End-of-match map change scheduled to {mapNameToChange} ({mapIdToChange})");
             Server.PrintToChatAll($" {ColorDefault} Changing map to {ColorGreen}{mapNameToChange}{ColorDefault}!");
-            _mapChangeTimer = AddTimer(5.0f, () =>
+            float postDelay = Math.Min(Math.Max(0f, Config.PostMapChangeDelay), 15.0f);
+            _mapChangeTimer = AddTimer(postDelay, () =>
             {
                 if (_unloaded) return;
                 try { Server.ExecuteCommand($"host_workshop_map {mapIdToChange}"); }
