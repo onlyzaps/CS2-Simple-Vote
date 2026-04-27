@@ -1,4 +1,4 @@
-# CS2SimpleVote
+# CS2 Simple Vote
 
 ```NOW SUPPORTS NESTED COLLECTIONS! RTV IS NOW FIXED!```
 https://buymeacoffee.com/theboneman
