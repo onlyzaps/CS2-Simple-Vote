@@ -9,6 +9,7 @@ using CounterStrikeSharp.API.Modules.Utils;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace CS2SimpleVote;
@@ -18,11 +19,11 @@ public class VoteConfig : BasePluginConfig
 {
     [JsonPropertyName("steam_api_key")] public string SteamApiKey { get; set; } = "YOUR_STEAM_API_KEY_HERE";
     [JsonPropertyName("collection_id")] public string CollectionId { get; set; } = "123456789";
-    [JsonPropertyName("vote_round")] public int VoteRound { get; set; } = 10;
+    [JsonPropertyName("vote_on_round")] public int VoteOnRound { get; set; } = 10;
     [JsonPropertyName("enable_rtv")] public bool EnableRtv { get; set; } = true;
     [JsonPropertyName("enable_nominate")] public bool EnableNominate { get; set; } = true;
     [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 6;
-    [JsonPropertyName("rtv_percentage")] public float RtvPercentage { get; set; } = 0.60f;
+    [JsonPropertyName("rtv_ratio")] public float RtvRatio { get; set; } = 0.60f;
     [JsonPropertyName("rtv_change_delay")] public float RtvDelaySeconds { get; set; } = 5.0f;
     [JsonPropertyName("postmap_change_delay")] public float PostMapChangeDelay { get; set; } = 10.0f;
     [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 8;
@@ -31,14 +32,13 @@ public class VoteConfig : BasePluginConfig
 
     // --- New Features ---
     [JsonPropertyName("server_name")] public string ServerName { get; set; } = "My CS2 Server";
-    [JsonPropertyName("show_map_message")] public bool ShowCurrentMapMessage { get; set; } = true;
+    [JsonPropertyName("enable_map_message")] public bool EnableMapMessage { get; set; } = true;
     [JsonPropertyName("map_message_interval")] public float CurrentMapMessageInterval { get; set; } = 300.0f;
-    [JsonPropertyName("enable_recent_maps")] public bool EnableRecentMaps { get; set; } = true;
+    [JsonPropertyName("omit_recent_maps")] public bool OmitRecentMaps { get; set; } = true;
     [JsonPropertyName("recent_maps_count")] public int RecentMapsCount { get; set; } = 5;
     [JsonPropertyName("vote_open_for_rounds")] public int VoteOpenForRounds { get; set; } = 1;
     [JsonPropertyName("show_midvote_progress")] public bool ShowMidVoteProgress { get; set; } = true;
     [JsonPropertyName("admins")] public List<ulong> Admins { get; set; } = new();
-    [JsonPropertyName("disco_party")] public bool DiscoParty { get; set; } = false;
 
     // Background collection refresh. The plugin re-fetches the Workshop collection
     // from Steam on this interval so maps added/removed from the collection are
@@ -57,7 +57,7 @@ public class MapItem
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.2.0";
+    public override string ModuleVersion => "1.3.0";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -104,10 +104,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private string? _expectedMapName;
     private string? _currentMapId;
 
-    // State: Disco Party
-    private int _discoTick;
-    private static readonly string[] DiscoColors =
-        { "#FF4040", "#FF9E40", "#FFFF40", "#40FF40", "#40FFFF", "#4C7DFF", "#C040FF", "#FF40C8" };
+    // State: Custom maps (added via !addmap) and omitted-map patterns (!omitmap).
+    // _customMaps is merged into _availableMaps at load and after every collection
+    // refresh. _omittedPatterns are word filters applied wherever players can pick
+    // maps (scheduled votes, RTV votes, nominations) — admin commands like
+    // !forcemap / !setnextmap deliberately still see everything.
+    private List<MapItem> _customMaps = new();
+    private List<string> _omittedPatterns = new();
 
     // State: Nomination
     private readonly List<MapItem> _nominatedMaps = new();
@@ -134,6 +137,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // File Paths
     private string _historyFilePath = "";
     private string _cacheFilePath = "";
+    private string _customMapsFilePath = "";
+    private string _omittedMapsFilePath = "";
+    private string _configFilePath = "";
 
     // Cancellation for background task
     private CancellationTokenSource _cts = new();
@@ -152,11 +158,126 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     public void OnConfigParsed(VoteConfig config)
     {
         Config = config;
+        ValidateConfig();
+    }
+
+    // Shared validation/clamping so OnConfigParsed and the on-map-change reload apply
+    // identical rules.
+    private void ValidateConfig()
+    {
         Config.VoteOptionsCount = Math.Clamp(Config.VoteOptionsCount, 2, 10);
         if (Config.NominatePerPage < 1) Config.NominatePerPage = 6;
+        // rtv_ratio is a fraction of connected players (0–1]. Clamp bad values so a
+        // config typo like 60 (instead of 0.60) can't make RTV impossible.
+        if (Config.RtvRatio <= 0f) Config.RtvRatio = 0.60f;
+        if (Config.RtvRatio > 1f) Config.RtvRatio = 1f;
         // Enforce a sane floor so a mistyped tiny value can't hammer the Steam API.
         if (Config.CollectionRefreshMinutes > 0 && Config.CollectionRefreshMinutes < 1.0f)
             Config.CollectionRefreshMinutes = 1.0f;
+    }
+
+    // Re-reads CS2SimpleVote.json from disk and applies it live. Called on every map
+    // start so hand edits take effect on the next map without a plugin reload. Runs on
+    // the game thread; a bad/partial file is caught and the previous config is kept.
+    private void ReloadConfigFromDisk()
+    {
+        if (string.IsNullOrEmpty(_configFilePath) || !File.Exists(_configFilePath)) return;
+
+        VoteConfig? parsed;
+        try
+        {
+            string json = File.ReadAllText(_configFilePath);
+            parsed = JsonSerializer.Deserialize<VoteConfig>(json, new JsonSerializerOptions
+            {
+                ReadCommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CS2SimpleVote] Config reload skipped (invalid JSON): {ex.Message}");
+            return;
+        }
+        if (parsed == null) return;
+
+        float oldRefresh = Config.CollectionRefreshMinutes;
+        string oldCollectionId = Config.CollectionId;
+        string oldApiKey = Config.SteamApiKey;
+
+        Config = parsed;
+        ValidateConfig();
+
+        // If the collection or API key changed, refetch immediately so the new pool is
+        // live this map instead of waiting for the next scheduled refresh.
+        if (!string.Equals(oldCollectionId, Config.CollectionId, StringComparison.Ordinal) ||
+            !string.Equals(oldApiKey, Config.SteamApiKey, StringComparison.Ordinal))
+        {
+            LaunchCollectionFetch(isInitial: false);
+        }
+
+        // Rebuild the background refresh timer if the interval changed (including
+        // enabling/disabling it via a 0).
+        if (Math.Abs(oldRefresh - Config.CollectionRefreshMinutes) > 0.001f)
+        {
+            _collectionRefreshTimer?.Kill();
+            _collectionRefreshTimer = null;
+            if (Config.CollectionRefreshMinutes > 0)
+            {
+                float interval = Config.CollectionRefreshMinutes * 60.0f;
+                _collectionRefreshTimer = AddTimer(interval, () =>
+                {
+                    if (_unloaded) return;
+                    if (_voteInProgress) return;
+                    LaunchCollectionFetch(isInitial: false);
+                }, TimerFlags.REPEAT);
+            }
+        }
+
+        Console.WriteLine("[CS2SimpleVote] Config reloaded from disk.");
+    }
+
+    // Keys that existed in older versions and are no longer part of the config schema.
+    // Includes the removed disco feature and the pre-rename keys.
+    private static readonly string[] LegacyConfigKeys =
+    {
+        "disco_party",
+        "vote_round",          // -> vote_on_round
+        "rtv_percentage",      // -> rtv_ratio
+        "enable_recent_maps",  // -> omit_recent_maps
+        "show_map_message"     // -> enable_map_message
+    };
+
+    // Surgically deletes stale keys from CS2SimpleVote.json without touching anything
+    // else (values, ordering, or unknown keys the user may have added). Only rewrites
+    // the file if something was actually removed.
+    private void StripLegacyConfigKeys()
+    {
+        if (string.IsNullOrEmpty(_configFilePath) || !File.Exists(_configFilePath)) return;
+
+        try
+        {
+            string json = File.ReadAllText(_configFilePath);
+            var node = JsonNode.Parse(json, documentOptions: new JsonDocumentOptions
+            {
+                CommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true
+            });
+            if (node is not JsonObject obj) return;
+
+            var removed = new List<string>();
+            foreach (var key in LegacyConfigKeys)
+                if (obj.Remove(key)) removed.Add(key);
+
+            if (removed.Count == 0) return;
+
+            string cleaned = obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(_configFilePath, cleaned);
+            Console.WriteLine($"[CS2SimpleVote] Removed legacy config key(s): {string.Join(", ", removed)}.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CS2SimpleVote] Could not clean legacy config keys: {ex.Message}");
+        }
     }
 
     public override void Load(bool hotReload)
@@ -185,8 +306,16 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         _historyFilePath = Path.Combine(configDir, "recent_maps.json");
         _cacheFilePath = Path.Combine(configDir, "map_cache.json");
+        _customMapsFilePath = Path.Combine(configDir, "custom_maps.json");
+        _omittedMapsFilePath = Path.Combine(configDir, "omitted_maps.json");
+        _configFilePath = Path.Combine(configDir, "CS2SimpleVote.json");
         _logBaseDir = Path.Combine(configDir, "logs");
         try { Directory.CreateDirectory(_logBaseDir); } catch { /* non-fatal */ }
+
+        // Remove keys left over from older versions (CounterStrikeSharp merges its
+        // generated config into the existing file and never deletes stale keys, so
+        // e.g. disco_party and the pre-rename keys would otherwise linger forever).
+        StripLegacyConfigKeys();
 
         // Clear existing memory state before loading
         _recentMaps.Clear();
@@ -194,6 +323,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // 1. Load Data Immediately (Sync)
         LoadMapHistory();
         LoadMapCache();
+        LoadCustomMaps();
+        LoadOmittedPatterns();
+        MergeCustomMapsInto(_availableMaps);
 
         // 3. Start Background Update (initial load), then schedule periodic refresh.
         LaunchCollectionFetch(isInitial: true);
@@ -221,9 +353,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
 
+        // HookMode.Pre so returning HookResult.Handled suppresses the chat message —
+        // plugin commands and vote/menu input are processed but never broadcast.
         _playerChatDelegate = OnPlayerChat;
-        AddCommandListener("say", _playerChatDelegate, HookMode.Post);
-        AddCommandListener("say_team", _playerChatDelegate, HookMode.Post);
+        AddCommandListener("say", _playerChatDelegate, HookMode.Pre);
+        AddCommandListener("say_team", _playerChatDelegate, HookMode.Pre);
 
         AddCommand("css_dumpmaps", "Dump all available map names to console", (caller, cmdInfo) =>
         {
@@ -305,6 +439,52 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             Server.PrintToChatAll($" {ColorDefault}An {ColorGreen}RTV vote{ColorDefault} has been started! The map will change when the vote ends.");
             StartMapVote(isRtv: true);
         });
+
+        AddCommand("css_addmap", "Add a workshop map by ID to custom_maps.json", (caller, cmdInfo) =>
+        {
+            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            {
+                cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                return;
+            }
+            AttemptAddMap(caller, cmdInfo.GetArg(1));
+        });
+
+        AddCommand("css_omitmap", "Omit maps matching the given words from votes and nominations", (caller, cmdInfo) =>
+        {
+            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            {
+                cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                return;
+            }
+            AttemptOmitMap(caller, cmdInfo.ArgString);
+        });
+
+        AddCommand("css_unomitmap", "Remove a saved omit pattern so matching maps can appear again", (caller, cmdInfo) =>
+        {
+            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            {
+                cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                return;
+            }
+            AttemptUnomitMap(caller, cmdInfo.ArgString);
+        });
+
+        AddCommand("css_addlist", "List maps added via addmap (custom_maps.json)", (caller, cmdInfo) =>
+        {
+            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            {
+                cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                return;
+            }
+            if (caller != null) { PrintAddList(caller); return; }
+
+            if (_customMaps.Count == 0) { cmdInfo.ReplyToCommand("[CS2SimpleVote] No custom maps added."); return; }
+            cmdInfo.ReplyToCommand($"--- CS2SimpleVote: {_customMaps.Count} Custom-Added Map(s) ---");
+            foreach (var m in _customMaps.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
+                cmdInfo.ReplyToCommand($"  {m.Name}  (ID: {m.Id})");
+            cmdInfo.ReplyToCommand($"--- End ({_customMaps.Count} custom map(s)) ---");
+        });
     }
 
     public override void Unload(bool hotReload)
@@ -331,6 +511,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // 3. Clear collections to release references
         _availableMaps.Clear();
         _recentMaps.Clear();
+        _customMaps.Clear();
+        _omittedPatterns.Clear();
         _rtvVoters.Clear();
         _activeVoteOptions.Clear();
         _playerVotes.Clear();
@@ -355,8 +537,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         if (_playerChatDelegate != null)
         {
-            RemoveCommandListener("say", _playerChatDelegate, HookMode.Post);
-            RemoveCommandListener("say_team", _playerChatDelegate, HookMode.Post);
+            RemoveCommandListener("say", _playerChatDelegate, HookMode.Pre);
+            RemoveCommandListener("say_team", _playerChatDelegate, HookMode.Pre);
             _playerChatDelegate = null;
         }
 
@@ -373,11 +555,21 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         ResetState();
         Server.ExecuteCommand("mp_endmatch_votenextmap 0");
 
+        // Re-read the main config so manual edits to CS2SimpleVote.json take effect
+        // on the next map without a reload/restart.
+        ReloadConfigFromDisk();
+
+        // Re-read the hand-editable lists each map so manual edits to
+        // custom_maps.json / omitted_maps.json are picked up without a reload.
+        LoadCustomMaps();
+        LoadOmittedPatterns();
+        MergeCustomMapsInto(_availableMaps);
+
         // Always resolve which workshop item we're now playing (consumes _expectedMapId),
         // and record it into the recent-maps history if that feature is enabled.
         ResolveCurrentMapAndUpdateHistory(mapName);
 
-        if (Config.ShowCurrentMapMessage && Config.CurrentMapMessageInterval > 0)
+        if (Config.EnableMapMessage && Config.CurrentMapMessageInterval > 0)
         {
             _mapInfoTimer = AddTimer(Config.CurrentMapMessageInterval, () =>
             {
@@ -513,6 +705,116 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Failed to save cache: {ex.Message}"); }
     }
 
+    // --- Custom Maps (custom_maps.json) ---
+
+    private void LoadCustomMaps()
+    {
+        try
+        {
+            if (!File.Exists(_customMapsFilePath)) { _customMaps = new List<MapItem>(); return; }
+            string json;
+            lock (_logLock) { json = File.ReadAllText(_customMapsFilePath); } // writers hold the same lock
+            var loaded = JsonSerializer.Deserialize<List<MapItem>>(json);
+            _customMaps = loaded?.Where(m => !string.IsNullOrEmpty(m.Id)).ToList() ?? new List<MapItem>();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CS2SimpleVote] Failed to load custom_maps.json: {ex.Message}");
+            _customMaps = new List<MapItem>();
+        }
+    }
+
+    private void SaveCustomMaps()
+    {
+        try
+        {
+            // Serialize on the game thread; write on a worker thread (same pattern as history).
+            string json = JsonSerializer.Serialize(_customMaps, new JsonSerializerOptions { WriteIndented = true });
+            string path = _customMapsFilePath;
+            Task.Run(() =>
+            {
+                try { lock (_logLock) { File.WriteAllText(path, json); } }
+                catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Failed to save custom_maps.json: {ex.Message}"); }
+            });
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Failed to save custom_maps.json: {ex.Message}"); }
+    }
+
+    // Merge custom maps into a map list in place (dedup by workshop ID). Called on the
+    // initial cache load, on every map start, and after every collection refresh so
+    // custom maps survive the background collection swap.
+    private void MergeCustomMapsInto(List<MapItem> target)
+    {
+        foreach (var cm in _customMaps)
+        {
+            if (!target.Any(m => m.Id.Equals(cm.Id, StringComparison.OrdinalIgnoreCase)))
+                target.Add(new MapItem { Id = cm.Id, Name = cm.Name });
+        }
+    }
+
+    // --- Omitted Maps (omitted_maps.json) ---
+    // The file is a plain JSON array of word patterns, e.g. ["motel night", "aim"].
+    // A map is omitted when its name contains EVERY word of a pattern,
+    // case-insensitively and regardless of word order. So "motel night" hides
+    // "Motel at Night" and "Night Motel v2".
+
+    private void LoadOmittedPatterns()
+    {
+        try
+        {
+            if (!File.Exists(_omittedMapsFilePath)) { _omittedPatterns = new List<string>(); return; }
+            string json;
+            lock (_logLock) { json = File.ReadAllText(_omittedMapsFilePath); } // writers hold the same lock
+            var loaded = JsonSerializer.Deserialize<List<string>>(json);
+            _omittedPatterns = loaded?
+                .Select(NormalizePattern)
+                .Where(p => p.Length > 0)
+                .Distinct()
+                .ToList() ?? new List<string>();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CS2SimpleVote] Failed to load omitted_maps.json: {ex.Message}");
+            _omittedPatterns = new List<string>();
+        }
+    }
+
+    private void SaveOmittedPatterns()
+    {
+        try
+        {
+            string json = JsonSerializer.Serialize(_omittedPatterns, new JsonSerializerOptions { WriteIndented = true });
+            string path = _omittedMapsFilePath;
+            Task.Run(() =>
+            {
+                try { lock (_logLock) { File.WriteAllText(path, json); } }
+                catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Failed to save omitted_maps.json: {ex.Message}"); }
+            });
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Failed to save omitted_maps.json: {ex.Message}"); }
+    }
+
+    // Lowercase, collapse whitespace: "  Motel   NIGHT " -> "motel night"
+    private static string NormalizePattern(string s)
+        => string.Join(' ', s.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToLowerInvariant();
+
+    private static bool MapMatchesPattern(string mapName, string pattern)
+    {
+        var words = pattern.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length == 0) return false;
+        return words.All(w => mapName.Contains(w, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Two patterns are the same filter if they contain the same words in any order.
+    private static bool SamePattern(string a, string b)
+    {
+        var wa = a.Split(' ', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x);
+        var wb = b.Split(' ', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x);
+        return wa.SequenceEqual(wb);
+    }
+
+    private bool IsOmittedMap(MapItem map) => _omittedPatterns.Any(p => MapMatchesPattern(map.Name, p));
+
     private void ResolveCurrentMapAndUpdateHistory(string currentMapName)
     {
         string? idToAdd = null;
@@ -581,7 +883,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         _currentMapId = idToAdd;
 
-        if (!Config.EnableRecentMaps) return;
+        if (!Config.OmitRecentMaps) return;
 
         _recentMaps.RemoveAll(m => m.Id.Equals(idToAdd, StringComparison.OrdinalIgnoreCase));
         _recentMaps.Add(new MapItem { Id = idToAdd, Name = nameToAdd ?? idToAdd });
@@ -767,6 +1069,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             {
                 if (_unloaded) { _collectionFetchRunning = false; _isApiLoading = false; return; }
 
+                // Custom maps (!addmap) live outside the collection — re-merge them so
+                // a background refresh can never silently drop them.
+                MergeCustomMapsInto(maps);
+
                 // Diff old vs new by workshop ID so the log shows exactly what changed.
                 // Computed here on the game thread where the old list is safe to read.
                 var oldIds = _availableMaps.Select(m => m.Id).ToHashSet();
@@ -854,47 +1160,81 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return HookResult.Continue;
         var p = player!;
         string msg = info.GetArg(1).Trim();
-        string cleanMsg = msg.StartsWith("!") ? msg[1..] : msg;
+        string cleanMsg = (msg.StartsWith("!") || msg.StartsWith("/")) ? msg[1..] : msg;
 
         // Parse command and potential arguments
         string[] inputs = cleanMsg.Split(' ', 2);
         string cmd = inputs[0];
         string? args = inputs.Length > 1 ? inputs[1].Trim() : null;
 
+        // Menu input (numbers / "cancel") is consumed by the open menu and hidden;
+        // anything else falls through and shows in chat normally.
         if (_nominatingPlayers.ContainsKey(p.Slot)) return HandleNominationInput(p, cleanMsg);
         if (_forcemapPlayers.ContainsKey(p.Slot)) return HandleForcemapInput(p, cleanMsg);
         if (_setnextmapPlayers.ContainsKey(p.Slot)) return HandleSetNextMapInput(p, cleanMsg);
 
-        if (cmd.Equals("rtv", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptRtv(p)); return HookResult.Continue; }
-        if (cmd.Equals("nominatelist", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNominationList(p)); return HookResult.Continue; }
-        if (cmd.Equals("help", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintHelp(p)); return HookResult.Continue; }
-        if (cmd.Equals("forcevote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceVote(p)); return HookResult.Continue; }
-        if (cmd.Equals("forcertv", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceRtv(p)); return HookResult.Continue; }
-        if (cmd.Equals("finishvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptFinishVote(p)); return HookResult.Continue; }
-        if (cmd.Equals("endwarmup", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndWarmup(p)); return HookResult.Continue; }
-        if (cmd.Equals("votedebug", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptVoteDebug(p)); return HookResult.Continue; }
-        if (cmd.Equals("revote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptRevote(p)); return HookResult.Continue; }
-        if (cmd.Equals("nextmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNextMap(p)); return HookResult.Continue; }
-        if (cmd.Equals("lastmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintLastMap(p)); return HookResult.Continue; }
-        if (cmd.Equals("recentmaps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintRecentMaps(p, args)); return HookResult.Continue; }
-        if (cmd.Equals("maplist", StringComparison.OrdinalIgnoreCase) || cmd.Equals("maps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintMapListToConsole(p)); return HookResult.Continue; }
+        // All recognized commands return HookResult.Handled so the message is never
+        // broadcast to other players (the listener runs in HookMode.Pre).
+        if (cmd.Equals("rtv", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptRtv(p)); return HookResult.Handled; }
+        if (cmd.Equals("nominatelist", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNominationList(p)); return HookResult.Handled; }
+        if (cmd.Equals("help", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintHelp(p)); return HookResult.Handled; }
+        if (cmd.Equals("forcevote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceVote(p)); return HookResult.Handled; }
+        if (cmd.Equals("forcertv", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceRtv(p)); return HookResult.Handled; }
+        if (cmd.Equals("finishvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptFinishVote(p)); return HookResult.Handled; }
+        if (cmd.Equals("endwarmup", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndWarmup(p)); return HookResult.Handled; }
+        if (cmd.Equals("votedebug", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptVoteDebug(p)); return HookResult.Handled; }
+        if (cmd.Equals("revote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptRevote(p)); return HookResult.Handled; }
+        if (cmd.Equals("nextmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintNextMap(p)); return HookResult.Handled; }
+        if (cmd.Equals("lastmap", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintLastMap(p)); return HookResult.Handled; }
+        if (cmd.Equals("recentmaps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintRecentMaps(p, args)); return HookResult.Handled; }
+        if (cmd.Equals("maplist", StringComparison.OrdinalIgnoreCase) || cmd.Equals("maps", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintMapListToConsole(p)); return HookResult.Handled; }
 
         if (cmd.Equals("nominate", StringComparison.OrdinalIgnoreCase) || cmd.Equals("nom", StringComparison.OrdinalIgnoreCase))
         {
             Server.NextFrame(() => AttemptNominate(p, args));
-            return HookResult.Continue;
+            return HookResult.Handled;
         }
 
         if (cmd.Equals("forcemap", StringComparison.OrdinalIgnoreCase))
         {
             Server.NextFrame(() => AttemptForcemap(p, args));
-            return HookResult.Continue;
+            return HookResult.Handled;
         }
 
         if (cmd.Equals("setnextmap", StringComparison.OrdinalIgnoreCase))
         {
             Server.NextFrame(() => AttemptSetNextMap(p, args));
-            return HookResult.Continue;
+            return HookResult.Handled;
+        }
+
+        if (cmd.Equals("addmap", StringComparison.OrdinalIgnoreCase))
+        {
+            Server.NextFrame(() => AttemptAddMapFromChat(p, args));
+            return HookResult.Handled;
+        }
+
+        if (cmd.Equals("omitmap", StringComparison.OrdinalIgnoreCase))
+        {
+            Server.NextFrame(() => AttemptOmitMapFromChat(p, args));
+            return HookResult.Handled;
+        }
+
+        if (cmd.Equals("unomitmap", StringComparison.OrdinalIgnoreCase))
+        {
+            Server.NextFrame(() => AttemptUnomitMapFromChat(p, args));
+            return HookResult.Handled;
+        }
+
+        if (cmd.Equals("omitlist", StringComparison.OrdinalIgnoreCase))
+        {
+            Server.NextFrame(() => PrintOmitList(p));
+            return HookResult.Handled;
+        }
+
+        if (cmd.Equals("addlist", StringComparison.OrdinalIgnoreCase))
+        {
+            Server.NextFrame(() => PrintAddList(p));
+            return HookResult.Handled;
         }
 
         if (_voteInProgress) return HandleVoteInput(p, cleanMsg);
@@ -938,6 +1278,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             $" {ColorDefault}RTV Voters: {_rtvVoters.Count}",
             $" {ColorDefault}Nominated Maps: {_nominatedMaps.Count}",
             $" {ColorDefault}Last Map: {ColorGreen}{lastMapDisplay}",
+            $" {ColorDefault}Custom Maps: {_customMaps.Count} | Omit Patterns: {_omittedPatterns.Count}",
             $" {ColorDefault}Target Collection ID: {Config.CollectionId}"
         };
 
@@ -1018,12 +1359,17 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         if (isAdmin)
         {
+            p.PrintToChat($" {ColorGreen}!addmap [workshop ID] {ColorDefault}- Add a workshop map to the map pool (Admin only)");
+            p.PrintToChat($" {ColorGreen}!addlist {ColorDefault}- List custom-added maps (Admin only)");
             p.PrintToChat($" {ColorGreen}!endwarmup {ColorDefault}- End the current warmup (Admin only)");
             p.PrintToChat($" {ColorGreen}!finishvote {ColorDefault}- End an active vote early (Admin only)");
             p.PrintToChat($" {ColorGreen}!forcemap [name] {ColorDefault}- Force change map (Admin only)");
             p.PrintToChat($" {ColorGreen}!forcertv {ColorDefault}- Start an RTV vote, map changes at vote end (Admin only)");
             p.PrintToChat($" {ColorGreen}!forcevote {ColorDefault}- Force start map vote (Admin only)");
+            p.PrintToChat($" {ColorGreen}!omitmap [words] {ColorDefault}- Hide matching maps from votes/nominations (Admin only)");
+            p.PrintToChat($" {ColorGreen}!omitlist {ColorDefault}- List saved omit patterns (Admin only)");
             p.PrintToChat($" {ColorGreen}!setnextmap [name] {ColorDefault}- Set the next map directly (Admin only)");
+            p.PrintToChat($" {ColorGreen}!unomitmap [words] {ColorDefault}- Remove an omit pattern (Admin only)");
             p.PrintToChat($" {ColorGreen}!votedebug {ColorDefault}- Show debug info (Admin only)");
         }
 
@@ -1054,22 +1400,26 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void PrintNextMap(CCSPlayerController? player)
     {
-        if (string.IsNullOrEmpty(_nextMapName)) { if (IsValidPlayer(player)) player!.PrintToChat($" {ColorDefault}The next map has not been decided yet."); return; }
-        Server.PrintToChatAll($" {ColorDefault}The next map will be: {ColorGreen}{_nextMapName}");
+        if (!IsValidPlayer(player)) return;
+        // Reply to the asker only — the command itself is hidden from other players,
+        // so a broadcast answer would just be unexplained chat noise for everyone else.
+        if (string.IsNullOrEmpty(_nextMapName)) { player!.PrintToChat($" {ColorDefault}The next map has not been decided yet."); return; }
+        player!.PrintToChat($" {ColorDefault}The next map will be: {ColorGreen}{_nextMapName}");
     }
 
     private void PrintLastMap(CCSPlayerController? player)
     {
+        if (!IsValidPlayer(player)) return;
         if (_recentMaps.Count > 1) 
         {
             // The current map is usually pushed to the end of _recentMaps upon OnMapStart.
             // Meaning, the "last" map before the current one is at count - 2.
             var lastMap = _recentMaps[_recentMaps.Count - 2];
-            Server.PrintToChatAll($" {ColorDefault}The last played map was: {ColorGreen}{lastMap.Name}");
+            player!.PrintToChat($" {ColorDefault}The last played map was: {ColorGreen}{lastMap.Name}");
         }
         else 
         {
-            if (IsValidPlayer(player)) player!.PrintToChat($" {ColorDefault}No previous map data found.");
+            player!.PrintToChat($" {ColorDefault}No previous map data found.");
         }
     }
 
@@ -1150,11 +1500,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         var p = player!;
         if (IsWarmup()) { p.PrintToChat($" {ColorDefault}RTV is disabled during warmup."); return; }
         if (!Config.EnableRtv) { p.PrintToChat($" {ColorDefault}RTV is currently disabled."); return; }
-        if (_voteInProgress || _voteFinished) return;
+        if (_voteInProgress) { p.PrintToChat($" {ColorDefault}A map vote is already in progress."); return; }
+        if (_voteFinished) { p.PrintToChat($" {ColorDefault}The next map has already been decided."); return; }
         if (!_rtvVoters.Add(p.Slot)) { p.PrintToChat($" {ColorDefault}You have already rocked the vote."); return; }
 
         int currentPlayers = GetHumanPlayers().Count();
-        int votesNeeded = (int)Math.Ceiling(currentPlayers * Config.RtvPercentage);
+        int votesNeeded = Math.Max(1, (int)Math.Ceiling(currentPlayers * Config.RtvRatio));
         Log("RTV", $"{PlayerTag(p)} rocked the vote ({_rtvVoters.Count}/{votesNeeded})");
         Server.PrintToChatAll($" {ColorDefault}{ColorGreen}{p.PlayerName}{ColorDefault} wants to change the map! ({_rtvVoters.Count}/{votesNeeded})");
 
@@ -1174,6 +1525,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         var validMaps = _availableMaps
             .Where(m => !_nominatedMaps.Any(n => n.Id == m.Id))
             .Where(m => !IsCurrentMap(m))
+            .Where(m => !IsOmittedMap(m))
             .ToList();
 
         if (!string.IsNullOrEmpty(searchTerm))
@@ -1444,6 +1796,340 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private void CloseSetNextMapMenu(CCSPlayerController player) { _setnextmapPlayers.Remove(player.Slot); _playerSetNextMapPage.Remove(player.Slot); }
 
+    // --- AddMap Logic (custom_maps.json) ---
+
+    private void AttemptAddMapFromChat(CCSPlayerController? player, string? arg)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+        AttemptAddMap(p, arg);
+    }
+
+    // Shared by chat (!addmap) and console (css_addmap). Caller may be null (console).
+    private void AttemptAddMap(CCSPlayerController? caller, string? arg)
+    {
+        void Reply(string text)
+        {
+            if (caller != null && caller.IsValid) caller.PrintToChat($" {ColorDefault}{text}");
+            else Console.WriteLine($"[CS2SimpleVote] {text.Replace(ColorGreen, "").Replace(ColorDefault, "")}");
+        }
+
+        string id = ExtractWorkshopId(arg);
+        if (string.IsNullOrEmpty(id))
+        {
+            Reply($"Usage: {ColorGreen}!addmap <workshop ID or workshop URL>{ColorDefault}");
+            return;
+        }
+
+        if (_customMaps.Any(m => m.Id.Equals(id, StringComparison.OrdinalIgnoreCase)))
+        {
+            Reply($"Workshop ID {ColorGreen}{id}{ColorDefault} is already in custom_maps.json.");
+            return;
+        }
+        var existing = _availableMaps.FirstOrDefault(m => m.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        if (existing != null)
+        {
+            Reply($"{ColorGreen}{existing.Name}{ColorDefault} ({id}) is already available via the collection.");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(Config.SteamApiKey) || Config.SteamApiKey == "YOUR_STEAM_API_KEY_HERE")
+        {
+            Reply("Cannot add map: no Steam API key configured (needed to look up the map name).");
+            return;
+        }
+
+        Reply($"Looking up workshop item {ColorGreen}{id}{ColorDefault}...");
+
+        int? callerSlot = caller?.Slot;
+        var token = _cts.Token;
+        Task.Run(async () =>
+        {
+            string? title = null;
+            string? error = null;
+            try { title = await FetchWorkshopTitle(id, token); }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex) { error = ex.Message; }
+
+            Server.NextFrame(() =>
+            {
+                if (_unloaded) return;
+
+                void LateReply(string text)
+                {
+                    var p = callerSlot.HasValue ? Utilities.GetPlayerFromSlot(callerSlot.Value) : null;
+                    if (p != null && p.IsValid) p.PrintToChat($" {ColorDefault}{text}");
+                    else Console.WriteLine($"[CS2SimpleVote] {text.Replace(ColorGreen, "").Replace(ColorDefault, "")}");
+                }
+
+                if (error != null || string.IsNullOrEmpty(title))
+                {
+                    LateReply($"Failed to add map {id}: {error ?? "no title returned (deleted/private item?)"}");
+                    return;
+                }
+
+                // Re-check duplicates: a collection refresh may have landed while we were fetching.
+                if (_customMaps.Any(m => m.Id.Equals(id, StringComparison.OrdinalIgnoreCase)) ||
+                    _availableMaps.Any(m => m.Id.Equals(id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    LateReply($"{title} ({id}) is already available.");
+                    return;
+                }
+
+                _customMaps.Add(new MapItem { Id = id, Name = title });
+                SaveCustomMaps();
+                _availableMaps.Add(new MapItem { Id = id, Name = title });
+
+                Log("ADMIN", $"addmap: {title} ({id}) added to custom_maps.json");
+                LateReply($"Added {ColorGreen}{title}{ColorDefault} ({id}) to custom maps. It is now available for votes and nominations.");
+            });
+        });
+    }
+
+    // Accepts a bare numeric workshop ID or a full workshop URL
+    // (e.g. https://steamcommunity.com/sharedfiles/filedetails/?id=123456789).
+    private static string ExtractWorkshopId(string? arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg)) return "";
+        string s = arg.Trim().Trim('"');
+
+        int idx = s.IndexOf("id=", StringComparison.OrdinalIgnoreCase);
+        if (idx >= 0)
+        {
+            s = s[(idx + 3)..];
+            int amp = s.IndexOf('&');
+            if (amp >= 0) s = s[..amp];
+        }
+
+        return (s.Length > 0 && s.Length <= 20 && s.All(char.IsDigit)) ? s : "";
+    }
+
+    // Looks up a single workshop item's title via IPublishedFileService/GetDetails.
+    private async Task<string?> FetchWorkshopTitle(string id, CancellationToken token)
+    {
+        var url = $"https://api.steampowered.com/IPublishedFileService/GetDetails/v1/?key={Uri.EscapeDataString(Config.SteamApiKey)}&publishedfileids%5B0%5D={id}";
+        var httpRes = await _httpClient.GetAsync(url, token);
+        if (!httpRes.IsSuccessStatusCode)
+            throw new Exception($"Steam API HTTP {(int)httpRes.StatusCode}");
+
+        string json = await httpRes.Content.ReadAsStringAsync(token);
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("response", out var respEl) ||
+            !respEl.TryGetProperty("publishedfiledetails", out var detailsArr) ||
+            detailsArr.GetArrayLength() == 0)
+            throw new Exception("Steam API returned no details for this ID.");
+
+        var item = detailsArr[0];
+        int result = item.TryGetProperty("result", out var resp) ? resp.GetInt32() : 0;
+        if (result != 1)
+            throw new Exception($"Steam result code {result} (item may be deleted, private, or banned).");
+
+        int fileType = item.TryGetProperty("file_type", out var ftp) ? ftp.GetInt32() : 0;
+        if (fileType == 2)
+            throw new Exception("That ID is a collection, not a map. Use the collection_id config for collections.");
+
+        return item.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
+    }
+
+    // --- OmitMap Logic (omitted_maps.json) ---
+
+    private void AttemptOmitMapFromChat(CCSPlayerController? player, string? words)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+        AttemptOmitMap(p, words);
+    }
+
+    // Shared by chat (!omitmap) and console (css_omitmap). Caller may be null (console).
+    private void AttemptOmitMap(CCSPlayerController? caller, string? words)
+    {
+        void Reply(string text)
+        {
+            if (caller != null && caller.IsValid) caller.PrintToChat($" {ColorDefault}{text}");
+            else Console.WriteLine($"[CS2SimpleVote] {text.Replace(ColorGreen, "").Replace(ColorDefault, "")}");
+        }
+
+        string pattern = NormalizePattern(words ?? "");
+        if (pattern.Length == 0)
+        {
+            Reply($"Usage: {ColorGreen}!omitmap <word(s)>{ColorDefault} — e.g. !omitmap motel night");
+            return;
+        }
+
+        var matches = _availableMaps.Where(m => MapMatchesPattern(m.Name, pattern)).ToList();
+        var customMatches = matches
+            .Where(m => _customMaps.Any(c => c.Id.Equals(m.Id, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+        var collectionMatches = matches.Except(customMatches).ToList();
+
+        // Maps that came from !addmap are simply deleted from custom_maps.json —
+        // no omit pattern is needed to keep them out.
+        if (customMatches.Count > 0)
+        {
+            foreach (var m in customMatches)
+            {
+                _customMaps.RemoveAll(c => c.Id.Equals(m.Id, StringComparison.OrdinalIgnoreCase));
+                _availableMaps.RemoveAll(c => c.Id.Equals(m.Id, StringComparison.OrdinalIgnoreCase));
+            }
+            SaveCustomMaps();
+            Log("ADMIN", $"{PlayerTag(caller)} omitmap '{pattern}': removed {customMatches.Count} custom map(s): {string.Join(", ", customMatches.Select(m => $"{m.Name} ({m.Id})"))}");
+            Reply($"Removed {ColorGreen}{customMatches.Count}{ColorDefault} custom map(s) from custom_maps.json: {ColorGreen}{string.Join(", ", customMatches.Select(m => m.Name))}");
+        }
+
+        // Collection maps can't be deleted from the collection, so they're filtered
+        // by pattern. The pattern is also saved when nothing matched right now, so it
+        // applies to maps added to the collection later.
+        if (collectionMatches.Count > 0 || matches.Count == 0)
+        {
+            if (_omittedPatterns.Any(existing => SamePattern(existing, pattern)))
+            {
+                Reply($"Pattern '{ColorGreen}{pattern}{ColorDefault}' is already in omitted_maps.json.");
+            }
+            else
+            {
+                _omittedPatterns.Add(pattern);
+                SaveOmittedPatterns();
+                Log("ADMIN", $"{PlayerTag(caller)} omitmap '{pattern}': pattern saved, currently matching {collectionMatches.Count} collection map(s)");
+
+                if (collectionMatches.Count > 0)
+                {
+                    const int maxNames = 8;
+                    string names = string.Join(", ", collectionMatches.Take(maxNames).Select(m => m.Name));
+                    if (collectionMatches.Count > maxNames) names += $", +{collectionMatches.Count - maxNames} more";
+                    Reply($"Omitting {ColorGreen}{collectionMatches.Count}{ColorDefault} map(s) from votes and nominations: {ColorGreen}{names}");
+                }
+                else
+                {
+                    Reply($"No maps currently match '{ColorGreen}{pattern}{ColorDefault}'. Pattern saved — it will apply to matching maps added later.");
+                }
+            }
+        }
+
+        // Pull any now-omitted maps out of the pending nomination list, and free their
+        // nominators to nominate again.
+        int purged = PurgeNominations(m => IsOmittedMap(m) || !_availableMaps.Any(a => a.Id.Equals(m.Id, StringComparison.OrdinalIgnoreCase)));
+        if (purged > 0)
+            Reply($"Removed {ColorGreen}{purged}{ColorDefault} pending nomination(s) that matched.");
+
+        // A live vote's options are locked in — omission takes effect from the next vote.
+        if (_voteInProgress && matches.Count > 0)
+            Reply("Note: a vote is currently in progress; its options are unchanged. Omission applies from the next vote.");
+    }
+
+    private int PurgeNominations(Func<MapItem, bool> shouldRemove)
+    {
+        var removed = _nominatedMaps.Where(shouldRemove).ToList();
+        foreach (var map in removed)
+        {
+            _nominatedMaps.RemoveAll(m => m.Id == map.Id);
+            var owners = _nominationOwner.Where(kv => kv.Value.Id == map.Id).Select(kv => kv.Key).ToList();
+            foreach (var steamId in owners)
+            {
+                _nominationOwner.Remove(steamId);
+                _hasNominatedSteamIds.Remove(steamId);
+            }
+        }
+        return removed.Count;
+    }
+
+    private void AttemptUnomitMapFromChat(CCSPlayerController? player, string? words)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+        AttemptUnomitMap(p, words);
+    }
+
+    // Shared by chat (!unomitmap) and console (css_unomitmap). Caller may be null (console).
+    private void AttemptUnomitMap(CCSPlayerController? caller, string? words)
+    {
+        void Reply(string text)
+        {
+            if (caller != null && caller.IsValid) caller.PrintToChat($" {ColorDefault}{text}");
+            else Console.WriteLine($"[CS2SimpleVote] {text.Replace(ColorGreen, "").Replace(ColorDefault, "")}");
+        }
+
+        string pattern = NormalizePattern(words ?? "");
+        if (pattern.Length == 0)
+        {
+            Reply($"Usage: {ColorGreen}!unomitmap <word(s)>{ColorDefault} — use {ColorGreen}!omitlist{ColorDefault} to see saved patterns.");
+            return;
+        }
+
+        int removed = _omittedPatterns.RemoveAll(existing => SamePattern(existing, pattern));
+        if (removed > 0)
+        {
+            SaveOmittedPatterns();
+            Log("ADMIN", $"{PlayerTag(caller)} unomitmap '{pattern}'");
+            Reply($"Removed omit pattern '{ColorGreen}{pattern}{ColorDefault}'. Matching maps can appear in votes again.");
+        }
+        else
+        {
+            Reply($"No saved pattern matches '{ColorGreen}{pattern}{ColorDefault}'. Use {ColorGreen}!omitlist{ColorDefault} to see saved patterns.");
+        }
+    }
+
+    private void PrintOmitList(CCSPlayerController? player)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+
+        if (_omittedPatterns.Count == 0)
+        {
+            p.PrintToChat($" {ColorDefault}No omit patterns saved.");
+            return;
+        }
+
+        p.PrintToChat($" {ColorDefault}--- {ColorGreen}Omitted Map Patterns ({_omittedPatterns.Count}) {ColorDefault}---");
+        foreach (var pattern in _omittedPatterns)
+        {
+            int count = _availableMaps.Count(m => MapMatchesPattern(m.Name, pattern));
+            p.PrintToChat($" {ColorGreen}'{pattern}'{ColorDefault} — currently matches {ColorGreen}{count}{ColorDefault} map(s)");
+        }
+    }
+
+    private void PrintAddList(CCSPlayerController? player)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+        if (!Config.Admins.Contains(p.SteamID))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+
+        if (_customMaps.Count == 0)
+        {
+            p.PrintToChat($" {ColorDefault}No custom maps added. Use {ColorGreen}!addmap <workshop ID>{ColorDefault} to add one.");
+            return;
+        }
+
+        p.PrintToChat($" {ColorDefault}--- {ColorGreen}Custom-Added Maps ({_customMaps.Count}) {ColorDefault}---");
+        foreach (var m in _customMaps.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            p.PrintToChat($" {ColorGreen}{m.Name}{ColorDefault} (ID: {ColorGreen}{m.Id}{ColorDefault})");
+        }
+    }
+
     // --- FinishVote Logic ---
     private void AttemptFinishVote(CCSPlayerController? player)
     {
@@ -1593,15 +2279,18 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _currentVoteRoundDuration = 0;
         _playerVotes.Clear(); _activeVoteOptions.Clear(); _nominatingPlayers.Clear(); _playerNominationPage.Clear();
 
-        var mapsToVote = new List<MapItem>(_nominatedMaps);
+        // Nominations are re-checked against the omit list here in case a pattern was
+        // added after the map was nominated.
+        var mapsToVote = _nominatedMaps.Where(m => !IsOmittedMap(m)).ToList();
         int slotsNeeded = Config.VoteOptionsCount - mapsToVote.Count;
         if (slotsNeeded > 0 && _availableMaps.Count > 0)
         {
             var potentialMaps = _availableMaps
                 .Where(m => !mapsToVote.Any(n => n.Id == m.Id))
-                .Where(m => !IsCurrentMap(m));
+                .Where(m => !IsCurrentMap(m))
+                .Where(m => !IsOmittedMap(m));
 
-            if (Config.EnableRecentMaps)
+            if (Config.OmitRecentMaps)
             {
                 // Strictly omit recently played maps from the random pool, even if that
                 // leaves fewer options than VoteOptionsCount. IsSameMap compares by
@@ -1653,8 +2342,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             if (_unloaded) return;
             try
             {
-                _discoTick++; // advance the color rotation each tick
-
                 string msg;
                 if (_isForceVote && _previousWinningMapId != null)
                 {
@@ -1666,38 +2353,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                     msg = "VOTE NOW!";
                 }
 
-                // Disco Party: build the HTML once per tick, not once per player
-                string? discoHtml = Config.DiscoParty ? BuildDiscoHtml(msg) : null;
-
                 foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot)))
                 {
-                    if (discoHtml != null) p.PrintToCenterHtml(discoHtml);
-                    else p.PrintToCenter(msg);
+                    p.PrintToCenter(msg);
                 }
             }
             catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Center message timer error: {ex.Message}"); }
         }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
-    }
-
-    // Wraps each visible character in a <font> tag with a bright color. The palette
-    // offset advances with _discoTick, so the colors "walk" across the text every
-    // second while the vote popup is displayed.
-    private string BuildDiscoHtml(string text)
-    {
-        var sb = new StringBuilder(text.Length * 28);
-        int colorIdx = _discoTick;
-        foreach (char c in text)
-        {
-            if (char.IsWhiteSpace(c)) { sb.Append(' '); continue; }
-            string safe = c switch { '<' => "&lt;", '>' => "&gt;", '&' => "&amp;", _ => c.ToString() };
-            sb.Append("<font color='")
-              .Append(DiscoColors[colorIdx % DiscoColors.Length])
-              .Append("'>")
-              .Append(safe)
-              .Append("</font>");
-            colorIdx++;
-        }
-        return sb.ToString();
     }
 
     private HookResult HandleVoteInput(CCSPlayerController player, string input)
@@ -1732,7 +2394,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         }
         else
         {
-            var winner = _playerVotes.Values.GroupBy(v => v).OrderByDescending(g => g.Count()).First();
+            // Random tie-break: without it, ties always favor whichever option
+            // happens to group first, which biases repeated votes the same way.
+            var grouped = _playerVotes.Values.GroupBy(v => v).ToList();
+            int topCount = grouped.Max(g => g.Count());
+            var tied = grouped.Where(g => g.Count() == topCount).ToList();
+            var winner = tied[Random.Shared.Next(tied.Count)];
             winningMapId = _activeVoteOptions[winner.Key]; _nextMapName = GetMapName(winningMapId); voteCount = winner.Count();
         }
         
@@ -1802,7 +2469,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         var voteCounts = _playerVotes.Values
             .GroupBy(v => v)
             .Select(g => new { OptionId = g.Key, Count = g.Count() })
-            .OrderBy(x => x.Count)
+            .OrderByDescending(x => x.Count)
             .ToList();
 
         Server.PrintToChatAll($" {ColorDefault}--- {ColorGreen}Vote Results {ColorDefault}---");
@@ -1819,10 +2486,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (_unloaded) return HookResult.Continue;
         if (_voteFinished || _voteInProgress || _nextMapSetByAdmin) return HookResult.Continue;
+        if (Config.VoteOnRound <= 0) return HookResult.Continue; // 0 disables the scheduled vote entirely
         try
         {
             var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules;
-            if (rules != null && rules.TotalRoundsPlayed + 1 == Config.VoteRound) StartMapVote(isRtv: false);
+            if (rules != null && rules.TotalRoundsPlayed + 1 == Config.VoteOnRound) StartMapVote(isRtv: false);
         }
         catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] OnRoundStart error: {ex.Message}"); }
         return HookResult.Continue;
@@ -1889,7 +2557,35 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
     private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
     {
-        if (@event.Userid is { } player) { _rtvVoters.Remove(player.Slot); _playerVotes.Remove(player.Slot); CloseNominationMenu(player); CloseForcemapMenu(player); CloseSetNextMapMenu(player); } return HookResult.Continue; }
+        if (@event.Userid is { } player)
+        {
+            _rtvVoters.Remove(player.Slot);
+            _playerVotes.Remove(player.Slot);
+            CloseNominationMenu(player);
+            CloseForcemapMenu(player);
+            CloseSetNextMapMenu(player);
+
+            // A departure lowers the RTV threshold — re-check so the remaining voters
+            // aren't left stuck at e.g. 3/3 with no way to trigger the vote.
+            if (!_unloaded && !_voteInProgress && !_voteFinished && Config.EnableRtv && _rtvVoters.Count > 0)
+            {
+                Server.NextFrame(() =>
+                {
+                    if (_unloaded || _voteInProgress || _voteFinished || _rtvVoters.Count == 0) return;
+                    int currentPlayers = GetHumanPlayers().Count();
+                    if (currentPlayers == 0) return;
+                    int votesNeeded = Math.Max(1, (int)Math.Ceiling(currentPlayers * Config.RtvRatio));
+                    if (_rtvVoters.Count >= votesNeeded)
+                    {
+                        Log("RTV", $"Threshold reached after disconnect ({_rtvVoters.Count}/{votesNeeded}) — starting vote");
+                        Server.PrintToChatAll($" {ColorDefault}RTV Threshold reached! Starting vote...");
+                        StartMapVote(isRtv: true);
+                    }
+                });
+            }
+        }
+        return HookResult.Continue;
+    }
 
     // --- Logging Infrastructure ---
     // Lightweight per-day event log. Only explicitly invoked for: map votes cast by players,
