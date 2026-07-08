@@ -54,6 +54,7 @@ The configuration file is generated at `.../configs/plugins/CS2SimpleVote/CS2Sim
 | `server_name` | `string` | `"My CS2 Server"` | The server name displayed in map broadcast messages. |
 | `show_map_message` | `bool` | `true` | Enables a recurring chat message showing the current map. |
 | `map_message_interval`| `float` | `300.0` | Interval in seconds between map info broadcasts. |
+| `disco_party` | `bool` | `false` | Makes the VOTE NOW! popup VERY obvious. |
 | `admins` | `List<ulong>` | `[]` | List of SteamID64s allowed to use admin commands. |
 
 ### Admin Configuration Example
