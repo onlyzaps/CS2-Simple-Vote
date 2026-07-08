@@ -18,6 +18,7 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 - **Add maps on the fly** — `!addmap` pulls any workshop item into the pool by ID or URL, saved to `custom_maps.json`.
 - **Omit maps instantly** — `!omitmap` hides maps by keyword across votes, RTV, and nominations — case-insensitive, word-order-independent, matches all.
 - **Recent-map exclusion** — recently played maps are kept out of the random pool.
+- **Live config reload** — edit `CS2SimpleVote.json` and it applies on the next map change, no restart.
 - **Hidden commands** — every command is intercepted silently and never spammed to public chat.
 - **Quiet & tick-safe** — all disk I/O is offloaded off the game thread.
 
@@ -48,6 +49,7 @@ Requires the player's SteamID64 in the `admins` config list.
 | Command | Description |
 |---|---|
 | `!addmap [workshop ID/URL]` | Add a workshop map to the pool (saved to `custom_maps.json`) |
+| `!addlist` | List maps added via `!addmap` |
 | `!omitmap [words]` | Hide all maps whose names contain the given words |
 | `!unomitmap [words]` | Remove a saved omit pattern |
 | `!omitlist` | List saved omit patterns and how many maps each matches |
@@ -76,7 +78,9 @@ Run from the **server console**:
 | Command | Description |
 |---|---|
 | `css_addmap <id/url>` | Add a workshop map to the pool |
+| `css_addlist` | List maps added via addmap |
 | `css_omitmap <words>` | Omit maps by keyword |
+| `css_unomitmap <words>` | Remove a saved omit pattern |
 | `css_setnextmap <name>` | Set the next map |
 | `css_forcemap <name>` | Force a map change |
 | `css_forcertv` | Start an RTV-style vote |
