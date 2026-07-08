@@ -22,21 +22,19 @@ public class VoteConfig : BasePluginConfig
     [JsonPropertyName("vote_on_round")] public int VoteOnRound { get; set; } = 5;
     [JsonPropertyName("enable_rtv")] public bool EnableRtv { get; set; } = true;
     [JsonPropertyName("enable_nominate")] public bool EnableNominate { get; set; } = true;
-    [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 6;
-    [JsonPropertyName("rtv_ratio")] public float RtvRatio { get; set; } = 0.60f;
+    [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 8;
+    [JsonPropertyName("rtv_ratio")] public float RtvRatio { get; set; } = 0.50f;
     [JsonPropertyName("rtv_change_delay")] public float RtvDelaySeconds { get; set; } = 5.0f;
     [JsonPropertyName("postmap_change_delay")] public float PostMapChangeDelay { get; set; } = 10.0f;
-    [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 8;
+    [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 5;
     [JsonPropertyName("vote_reminder_enabled")] public bool EnableReminders { get; set; } = true;
     [JsonPropertyName("vote_reminder_interval")] public float ReminderIntervalSeconds { get; set; } = 30.0f;
-
-    // --- New Features ---
     [JsonPropertyName("server_name")] public string ServerName { get; set; } = "My CS2 Server";
     [JsonPropertyName("enable_map_message")] public bool EnableMapMessage { get; set; } = true;
     [JsonPropertyName("map_message_interval")] public float CurrentMapMessageInterval { get; set; } = 300.0f;
     [JsonPropertyName("omit_recent_maps")] public bool OmitRecentMaps { get; set; } = true;
-    [JsonPropertyName("recent_maps_count")] public int RecentMapsCount { get; set; } = 5;
-    [JsonPropertyName("vote_open_for_rounds")] public int VoteOpenForRounds { get; set; } = 1;
+    [JsonPropertyName("recent_maps_count")] public int RecentMapsCount { get; set; } = 10;
+    [JsonPropertyName("vote_open_for_rounds")] public int VoteOpenForRounds { get; set; } = 3;
     [JsonPropertyName("show_midvote_progress")] public bool ShowMidVoteProgress { get; set; } = true;
     [JsonPropertyName("admins")] public List<ulong> Admins { get; set; } = new();
 
