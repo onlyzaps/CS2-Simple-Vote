@@ -19,7 +19,7 @@ public class VoteConfig : BasePluginConfig
 {
     [JsonPropertyName("steam_api_key")] public string SteamApiKey { get; set; } = "YOUR_STEAM_API_KEY_HERE";
     [JsonPropertyName("collection_id")] public string CollectionId { get; set; } = "123456789";
-    [JsonPropertyName("vote_on_round")] public int VoteOnRound { get; set; } = 10;
+    [JsonPropertyName("vote_on_round")] public int VoteOnRound { get; set; } = 5;
     [JsonPropertyName("enable_rtv")] public bool EnableRtv { get; set; } = true;
     [JsonPropertyName("enable_nominate")] public bool EnableNominate { get; set; } = true;
     [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 6;
