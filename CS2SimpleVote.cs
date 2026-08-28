@@ -117,7 +117,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.9.1";
+    public override string ModuleVersion => "1.9.2";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3473,7 +3473,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             float voteSeconds = (isRtv || isRevote) ? 30.0f : Config.TimedVoteSeconds;
             _voteTotalSeconds = voteSeconds;
             _voteEndsAtUtc = DateTime.UtcNow.AddSeconds(voteSeconds);
-            Server.PrintToChatAll($" {ColorDefault}Vote ending in {ColorGreen}{voteSeconds:0}{ColorDefault} seconds!");
+            Server.PrintToChatAll($" {ColorDefault}Vote ending in {ColorGreen}{FormatDuration((int)Math.Round(voteSeconds))}{ColorDefault}!");
             _voteEndTimer = AddTimer(voteSeconds, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
         }
         else
@@ -3515,7 +3515,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 else
                 {
                     string msg = _voteIsTimed
-                        ? $"VOTE NOW! Time Remaining: {VoteSecondsRemaining()}s"
+                        ? $"VOTE NOW! Time Remaining: {FormatDuration(VoteSecondsRemaining())}"
                         : "VOTE NOW!";
                     foreach (var p in GetHumanPlayers().Where(p => !_playerVotes.ContainsKey(p.Slot)))
                         p.PrintToCenter(msg);
@@ -3656,7 +3656,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             string mapIdToChange = winningMapId;
             string mapNameToChange = _nextMapName ?? GetMapName(winningMapId);
             Log("MAPCHANGE", $"RTV winner {mapNameToChange} ({mapIdToChange}) — changing map in {delay}s");
-            Server.PrintToChatAll($" {ColorDefault}Changing map to {ColorGreen}{mapNameToChange}{ColorDefault} in {ColorGreen}{delay:0.#}{ColorDefault}s...");
+            Server.PrintToChatAll($" {ColorDefault}Changing map to {ColorGreen}{mapNameToChange}{ColorDefault} in {ColorGreen}{FormatDuration((int)Math.Round(delay))}{ColorDefault}...");
             _mapChangeTimer = AddTimer(delay, () =>
             {
                 if (_unloaded) return;
@@ -3686,6 +3686,16 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private int VoteSecondsRemaining()
         => _voteIsTimed ? Math.Max(0, (int)Math.Ceiling((_voteEndsAtUtc - DateTime.UtcNow).TotalSeconds)) : 0;
+
+    // Compact clock for every countdown the plugin shows: "45s" under a minute,
+    // "2m" on the minute, "1m20s" in between.
+    internal static string FormatDuration(int seconds)
+    {
+        if (seconds < 0) seconds = 0;
+        if (seconds < 60) return $"{seconds}s";
+        int m = seconds / 60, s = seconds % 60;
+        return s == 0 ? $"{m}m" : $"{m}m{s}s";
+    }
 
     // --- Center vote panel (enable_vote_hud) ---
     // A display-only center-screen panel in the style of CS2MenuManager's
@@ -4152,7 +4162,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             int remaining = VoteSecondsRemaining();
             float frac = _voteTotalSeconds > 0 ? remaining / _voteTotalSeconds : 1f;
             string color = frac > 0.5f ? "#4CAF50" : frac > 0.25f ? "#FFD700" : "#FF4444";
-            sb.Append($" - </b></font><font color='{color}'><b>{remaining}s</b></font>");
+            sb.Append($" - </b></font><font color='{color}'><b>{FormatDuration(remaining)}</b></font>");
         }
         else sb.Append("</b></font>");
 
