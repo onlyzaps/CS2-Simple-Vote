@@ -289,7 +289,7 @@ Generated straight from the server engine — map names from the `.vpk` files in
 
 ## 🚀 Installation
 
-1. Install [CounterStrikeSharp](https://docs.cssharp.dev/) on your server.
+1. Install an up-to-date [CounterStrikeSharp](https://docs.cssharp.dev/) on your server — the plugin targets the current API (**v1.0.370+ / .NET 10 runtime**).
 2. Drop the compiled plugin into `addons/counterstrikesharp/plugins/CS2SimpleVote/`.
 3. Start the server once to generate the config, then set your `steam_api_key`, `collection_id`, and `admins`.
 4. Reload the plugin or restart — done.

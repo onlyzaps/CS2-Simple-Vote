@@ -3428,10 +3428,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
 
     // Fetches (or creates) the predicted viewmodel the worldtext entities parent to.
-    // This CounterStrikeSharp build generates no viewmodel wrapper classes, so both
-    // the services component pointer and the m_hViewModel offset are resolved by
-    // name straight from the game's own schema system at runtime. The entity is
-    // only ever handed to SetParent, so the CBaseEntity wrapper is all we need.
+    // CounterStrikeSharp removed the typed viewmodel wrapper classes (CCSGOViewModel /
+    // ViewModelServices) after ~v1.0.318 — screen-menu libraries pin that ancient
+    // build to keep them. On current CSS the supported approach is this one: resolve
+    // the services component pointer and the m_hViewModel offset by name from the
+    // game's own schema system at runtime. The entity is only ever handed to
+    // SetParent, so the CBaseEntity wrapper is all we need.
     private static CBaseEntity? EnsureCustomView(CCSPlayerPawn pawn)
     {
         nint services = Schema.GetSchemaValue<nint>(pawn.Handle, "CCSPlayerPawnBase", "m_pViewModelServices");
