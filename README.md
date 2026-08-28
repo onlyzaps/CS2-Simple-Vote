@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.7.7-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.7.8-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -40,7 +40,7 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 | `!lastmap` | Show the previously played map |
 | `!recentmaps [n]` | Show recently played maps |
 | `!maplist` / `!maps` | Print the full map list to your console |
-| `!help` | List available commands |
+| `!help` | List available commands (admins get a picker: user or admin commands) |
 
 > Both `!` and `/` prefixes work, and commands are hidden from other players.
 > During a vote, type the option's **number** to cast your vote — including `0` (or `!0`) for **Extend Current Map** when the extend option is enabled.
@@ -62,7 +62,8 @@ Requires the player's SteamID64 in the `admins` config list.
 | `!setnextmap [name]` | Set the next map directly (no vote; sees disabled maps too) |
 | `!forcevote` | Force-start a map vote |
 | `!forcertv` | Start an RTV-style vote (map changes when it ends) |
-| `!finishvote` | End an active vote early |
+| `!endvote` | End an active vote early |
+| `!changenow` | Change to the queued next map immediately |
 | `!endwarmup` | End the current warmup |
 | `!votedebug` | Show plugin state / diagnostics |
 
@@ -173,7 +174,7 @@ Type a number to vote          ← yellow header
 42s remaining                  ← timed votes: green → yellow → red
 ```
 
-Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in, stays up for the whole vote, and disappears the moment the vote ends. Updates are **flash-free**: the cached panel is fed to the display every tick (the same approach CounterStrikeSharp's own CenterHtmlMenu uses), which keeps it rock solid — identical re-sends and content swaps are both seamless, so nothing fades or pulses between updates. Lines are width-padded so the **option numbers line up in a straight column**, and a map name too long for the panel never word-wraps — it **scrolls marquee-style** through its slot (4 steps per second) while the number and tally stay fixed. The countdown footer turns **green** above 50% time left, **yellow** down to 25%, then **red**. While the panel is enabled, the option list is no longer printed into chat (chat still announces the vote and the winner).
+Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in, stays up for the whole vote, and disappears the moment the vote ends. Updates are **flash-free**: the cached panel is fed to the display every tick (the same approach CounterStrikeSharp's own CenterHtmlMenu uses), which keeps it rock solid — identical re-sends and content swaps are both seamless, so nothing fades or pulses between updates. Lines are width-padded so the **option numbers line up in a straight column**, and a map name too long for the panel never word-wraps — it **scrolls marquee-style** through its slot (4 steps per second), kept slightly narrower than the other rows so it can't skew the column, while the number and tally stay fixed. The countdown footer turns **green** above 50% time left, **yellow** down to 25%, then **red**. While the panel is enabled, the option list is no longer printed into chat (chat still announces the vote and the winner).
 
 ### Vote Reminders
 

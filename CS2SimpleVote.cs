@@ -111,10 +111,11 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.7";
+    public override string ModuleVersion => "1.7.8";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
+    private const string ColorRed = "\x07";
 
     public VoteConfig Config { get; set; } = new();
 
@@ -208,6 +209,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private readonly Dictionary<int, int> _playerNominationPage = new();
 
     private CommandInfo.CommandListenerCallback? _playerChatDelegate;
+
+    // State: Help picker (admins choose between user/admin command lists)
+    private readonly HashSet<int> _helpMenuPlayers = new();
 
     // State: Forcemap
     private readonly Dictionary<int, List<MapItem>> _forcemapPlayers = new();
@@ -891,6 +895,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _playerForcemapPage.Clear();
         _setnextmapPlayers.Clear();
         _playerSetNextMapPage.Clear();
+        _helpMenuPlayers.Clear();
 
         _reminderTimer?.Kill();
         _reminderTimer = null;
@@ -1936,6 +1941,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         // Menu input (numbers / "cancel") is consumed by the open menu and hidden;
         // anything else falls through and shows in chat normally.
+        if (_helpMenuPlayers.Contains(p.Slot)) return HandleHelpInput(p, cleanMsg);
         if (_nominatingPlayers.ContainsKey(p.Slot)) return HandleNominationInput(p, cleanMsg);
         if (_forcemapPlayers.ContainsKey(p.Slot)) return HandleForcemapInput(p, cleanMsg);
         if (_setnextmapPlayers.ContainsKey(p.Slot)) return HandleSetNextMapInput(p, cleanMsg);
@@ -1947,7 +1953,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (cmd.Equals("help", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintHelp(p)); return HookResult.Handled; }
         if (cmd.Equals("forcevote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceVote(p)); return HookResult.Handled; }
         if (cmd.Equals("forcertv", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceRtv(p)); return HookResult.Handled; }
-        if (cmd.Equals("finishvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptFinishVote(p)); return HookResult.Handled; }
+        if (cmd.Equals("endvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndVote(p)); return HookResult.Handled; }
+        if (cmd.Equals("changenow", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptChangeNow(p)); return HookResult.Handled; }
         if (cmd.Equals("endwarmup", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndWarmup(p)); return HookResult.Handled; }
         if (cmd.Equals("votedebug", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptVoteDebug(p)); return HookResult.Handled; }
         if (cmd.Equals("revote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptRevote(p)); return HookResult.Handled; }
@@ -2124,30 +2131,46 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         });
     }
 
+    // !help: regular players get the user commands directly; admins get a picker
+    // (same chat-menu format as a multi-match nomination) choosing between the
+    // user and admin lists. Admin commands render in red, user commands in green.
     private void PrintHelp(CCSPlayerController? player)
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        bool isAdmin = IsVoteAdmin(p);
-
-        p.PrintToChat($" {ColorDefault}---{ColorGreen} CS2SimpleVote Commands {ColorDefault}---");
-
-        if (isAdmin)
+        if (!IsVoteAdmin(p))
         {
-            p.PrintToChat($" {ColorGreen}!addmap [workshop ID] {ColorDefault}- Add/re-enable a workshop map (workshop_maps.json) (Admin only)");
-            p.PrintToChat($" {ColorGreen}!addlist {ColorDefault}- List manually added workshop maps (Admin only)");
-            p.PrintToChat($" {ColorGreen}!endwarmup {ColorDefault}- End the current warmup (Admin only)");
-            p.PrintToChat($" {ColorGreen}!finishvote {ColorDefault}- End an active vote early (Admin only)");
-            p.PrintToChat($" {ColorGreen}!forcemap [name] {ColorDefault}- Force change map (Admin only)");
-            p.PrintToChat($" {ColorGreen}!forcertv {ColorDefault}- Start an RTV vote, map changes at vote end (Admin only)");
-            p.PrintToChat($" {ColorGreen}!forcevote {ColorDefault}- Force start map vote (Admin only)");
-            p.PrintToChat($" {ColorGreen}!omitmap [words] {ColorDefault}- Disable matching maps (removed from votes) (Admin only)");
-            p.PrintToChat($" {ColorGreen}!omitlist {ColorDefault}- List omitted (disabled) maps (Admin only)");
-            p.PrintToChat($" {ColorGreen}!setnextmap [name] {ColorDefault}- Set the next map directly (Admin only)");
-            p.PrintToChat($" {ColorGreen}!unomitmap [words] {ColorDefault}- Re-enable matching maps (Admin only)");
-            p.PrintToChat($" {ColorGreen}!votedebug {ColorDefault}- Show debug info (Admin only)");
+            PrintUserHelp(p);
+            return;
         }
 
+        _helpMenuPlayers.Add(p.Slot);
+        p.PrintToChat($" {ColorDefault}Page 1/1. Type number to select (or 'cancel'):");
+        p.PrintToChat($" {ColorGreen}[1] {ColorDefault}User Commands");
+        p.PrintToChat($" {ColorRed}[2] {ColorDefault}Admin Commands");
+    }
+
+    private HookResult HandleHelpInput(CCSPlayerController player, string input)
+    {
+        if (input.Equals("cancel", StringComparison.OrdinalIgnoreCase))
+        {
+            _helpMenuPlayers.Remove(player.Slot);
+            player.PrintToChat($" {ColorDefault}Help cancelled.");
+            return HookResult.Handled;
+        }
+        if (input == "1" || input == "2")
+        {
+            _helpMenuPlayers.Remove(player.Slot);
+            if (input == "1") PrintUserHelp(player);
+            else PrintAdminHelp(player);
+            return HookResult.Handled;
+        }
+        return HookResult.Continue;
+    }
+
+    private void PrintUserHelp(CCSPlayerController p)
+    {
+        p.PrintToChat($" {ColorDefault}---{ColorGreen} CS2SimpleVote Commands {ColorDefault}---");
         p.PrintToChat($" {ColorGreen}!help {ColorDefault}- List available commands");
         p.PrintToChat($" {ColorGreen}!lastmap {ColorDefault}- Show last played map");
         p.PrintToChat($" {ColorGreen}!maplist {ColorDefault}/ {ColorGreen}!maps {ColorDefault}- Print the full map list to your console");
@@ -2157,6 +2180,24 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         p.PrintToChat($" {ColorGreen}!recentmaps {ColorDefault}- Show recently played maps");
         p.PrintToChat($" {ColorGreen}!revote {ColorDefault}- Recast vote");
         p.PrintToChat($" {ColorGreen}!rtv {ColorDefault}- Rock the Vote");
+    }
+
+    private void PrintAdminHelp(CCSPlayerController p)
+    {
+        p.PrintToChat($" {ColorDefault}---{ColorRed} CS2SimpleVote Admin Commands {ColorDefault}---");
+        p.PrintToChat($" {ColorRed}!addmap [workshop ID] {ColorDefault}- Add/re-enable a workshop map (workshop_maps.json)");
+        p.PrintToChat($" {ColorRed}!addlist {ColorDefault}- List manually added workshop maps");
+        p.PrintToChat($" {ColorRed}!changenow {ColorDefault}- Change to the queued next map immediately");
+        p.PrintToChat($" {ColorRed}!endvote {ColorDefault}- End an active vote early");
+        p.PrintToChat($" {ColorRed}!endwarmup {ColorDefault}- End the current warmup");
+        p.PrintToChat($" {ColorRed}!forcemap [name] {ColorDefault}- Force change map");
+        p.PrintToChat($" {ColorRed}!forcertv {ColorDefault}- Start an RTV vote, map changes at vote end");
+        p.PrintToChat($" {ColorRed}!forcevote {ColorDefault}- Force start map vote");
+        p.PrintToChat($" {ColorRed}!omitmap [words] {ColorDefault}- Disable matching maps (removed from votes)");
+        p.PrintToChat($" {ColorRed}!omitlist {ColorDefault}- List omitted (disabled) maps");
+        p.PrintToChat($" {ColorRed}!setnextmap [name] {ColorDefault}- Set the next map directly");
+        p.PrintToChat($" {ColorRed}!unomitmap [words] {ColorDefault}- Re-enable matching maps");
+        p.PrintToChat($" {ColorRed}!votedebug {ColorDefault}- Show debug info");
     }
 
     private void PrintNominationList(CCSPlayerController? player)
@@ -2294,7 +2335,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
         if (!Config.EnableNominate) { p.PrintToChat($" {ColorDefault}Nominations are currently disabled."); return; }
-        if (_voteInProgress || _voteFinished) { p.PrintToChat($" {ColorDefault}Voting has already finished."); return; }
+        if (_voteInProgress) { p.PrintToChat($" {ColorDefault}A map vote is in progress — type the {ColorGreen}number{ColorDefault} in chat to vote!"); return; }
+        if (_voteFinished) { p.PrintToChat($" {ColorDefault}Voting has already finished — the next map is decided."); return; }
         
         bool isRenomination = _hasNominatedSteamIds.Contains(p.SteamID);
         if (!isRenomination && _nominatedMaps.Count >= Config.VoteOptionsCount) { p.PrintToChat($" {ColorDefault}The nomination list is full!"); return; }
@@ -2968,7 +3010,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
 
     // --- FinishVote Logic ---
-    private void AttemptFinishVote(CCSPlayerController? player)
+    private void AttemptEndVote(CCSPlayerController? player)
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
@@ -2985,9 +3027,47 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return;
         }
 
-        Log("ADMIN", $"{PlayerTag(p)} ran !finishvote");
+        Log("ADMIN", $"{PlayerTag(p)} ran !endvote");
         Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} ended the vote early.");
         EndVote();
+    }
+
+    // --- ChangeNow Logic ---
+    // Immediately switches to the map already queued as the next map (set by a
+    // finished vote or !setnextmap), instead of waiting for the end of the match.
+    private void AttemptChangeNow(CCSPlayerController? player)
+    {
+        if (!IsValidPlayer(player)) return;
+        var p = player!;
+
+        if (!IsVoteAdmin(p))
+        {
+            p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            return;
+        }
+
+        if (_voteInProgress)
+        {
+            p.PrintToChat($" {ColorDefault}A vote is currently in progress — wait for it to finish (or use !endvote).");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(_pendingMapId))
+        {
+            p.PrintToChat($" {ColorDefault}No next map is queued yet.");
+            return;
+        }
+
+        string mapId = _pendingMapId;
+        string mapName = GetMapName(mapId);
+        Log("ADMIN", $"{PlayerTag(p)} ran !changenow -> {mapName} ({mapId})");
+        Log("MAPCHANGE", $"Changing now to queued next map {mapName} ({mapId})");
+        Server.PrintToChatAll($" {ColorDefault}Admin {ColorGreen}{p.PlayerName}{ColorDefault} is changing the map to {ColorGreen}{mapName}{ColorDefault} now!");
+        _mapChangeTimer?.Kill();
+        _mapChangeTimer = null;
+        _expectedMapId = mapId;
+        _expectedMapName = mapName;
+        ChangeMap(mapId);
     }
 
     // --- EndWarmup Logic ---
@@ -3449,7 +3529,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
             string prefix = $"{kvp.Key}: ";
             string tally = $" ({votes})";
-            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally) - 0.5f;
+            // The extra margin keeps a scrolled row visibly narrower than the shared
+            // padded target — estimator error on a full-budget marquee row otherwise
+            // pushes its real width past the others and skews the number column.
+            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally) - 2.0f;
             string name = MarqueeName(OptionName(kvp.Value), budget);
             rows.Add((prefix + name + tally,
                 $"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font> <font color='#B0B0B0'>({votes})</font>"));
@@ -3636,6 +3719,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             CloseNominationMenu(player);
             CloseForcemapMenu(player);
             CloseSetNextMapMenu(player);
+            _helpMenuPlayers.Remove(player.Slot);
 
             // A departure lowers the RTV threshold — re-check so the remaining voters
             // aren't left stuck at e.g. 3/3 with no way to trigger the vote.
