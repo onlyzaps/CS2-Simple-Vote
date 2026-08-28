@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.6";
+    public override string ModuleVersion => "1.7.7";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3193,9 +3193,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
         }
 
-        // 0.5s refresh tick: updates the vote panel (countdown + tallies, sent only
-        // on change/heartbeat) in HUD mode, or re-sends the plain VOTE NOW prompt.
-        _centerMessageTimer = AddTimer(0.5f, () => {
+        // 0.25s refresh tick: updates the vote panel (countdown, tallies, and one
+        // marquee step for long names) in HUD mode, or re-sends the VOTE NOW prompt.
+        _centerMessageTimer = AddTimer(0.25f, () => {
             if (_unloaded) return;
             try
             {
@@ -3381,7 +3381,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // (the duration parameter does not reliably keep it alive, so sending only on
     // change leaves visible gaps), while identical re-fires and content swaps are
     // both seamless — the panel sits rock solid and updates without flashing. The
-    // string itself is rebuilt only on the 0.5s timer and when a vote is cast.
+    // string itself is rebuilt only on the 0.25s timer and when a vote is cast.
     //
     // Alignment: the panel centers every line individually, which scatters the
     // option numbers when map names differ in width. Each line is therefore
@@ -3418,7 +3418,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     // Returns the name unchanged when it fits the budget; otherwise a window into
     // "name • name • ..." that slides one character per rebuild tick, so long names
-    // scroll continuously while the rest of the line stays put.
+    // scroll continuously (one step per 0.25s tick) while the rest stays put.
     private string MarqueeName(string name, float budgetUnits)
     {
         if (EstimateHudWidth(name) <= budgetUnits) return name;
@@ -3449,7 +3449,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
             string prefix = $"{kvp.Key}: ";
             string tally = $" ({votes})";
-            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally);
+            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally) - 0.5f;
             string name = MarqueeName(OptionName(kvp.Value), budget);
             rows.Add((prefix + name + tally,
                 $"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font> <font color='#B0B0B0'>({votes})</font>"));
@@ -3462,13 +3462,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             rows.Add(($"{remaining}s remaining", $"<font color='{color}'>{remaining}s remaining</font>"));
         }
 
-        float maxWidth = rows.Max(r => EstimateHudWidth(r.plain));
+        // Pad every line to the CONSTANT budget rather than to the widest line of
+        // the moment — otherwise each marquee step changes the max width and
+        // re-pads every other row, wobbling the whole column.
         var sb = new StringBuilder();
         for (int i = 0; i < rows.Count; i++)
         {
             if (i > 0) sb.Append("<br>");
             sb.Append(rows[i].html);
-            int pad = (int)Math.Round((maxWidth - EstimateHudWidth(rows[i].plain)) / 0.55f);
+            int pad = (int)Math.Round((HudMaxLineUnits - EstimateHudWidth(rows[i].plain)) / 0.50f);
             for (int n = 0; n < pad; n++) sb.Append(' '); // nbsp - plain spaces collapse
         }
         return sb.ToString();
