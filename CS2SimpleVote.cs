@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.3";
+    public override string ModuleVersion => "1.7.4";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -605,7 +605,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
-        RegisterListener<Listeners.OnTick>(OnVoteHudTick);
 
         // HookMode.Pre so returning HookResult.Handled suppresses the chat message —
         // plugin commands and vote/menu input are processed but never broadcast.
@@ -809,7 +808,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
-        RemoveListener<Listeners.OnTick>(OnVoteHudTick);
         _voteCenterHtmlCache = "";
 
         if (_playerChatDelegate != null)
@@ -3178,7 +3176,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // The center panel replaces the chat option list entirely while enabled;
         // players still vote by typing the number in chat.
         if (Config.EnableVoteHud)
-            _voteCenterHtmlCache = BuildVoteCenterHtml();
+            RefreshVotePanel(force: true);
         else
             PrintVoteOptionsToAll();
 
@@ -3193,16 +3191,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
         }
 
-        // 0.5s refresh tick: rebuilds the cached vote panel (countdown + tallies)
-        // in HUD mode — the per-tick listener does the actual sending — or re-sends
-        // the plain VOTE NOW prompt otherwise.
+        // 0.5s refresh tick: updates the vote panel (countdown + tallies, sent only
+        // on change/heartbeat) in HUD mode, or re-sends the plain VOTE NOW prompt.
         _centerMessageTimer = AddTimer(0.5f, () => {
             if (_unloaded) return;
             try
             {
                 if (Config.EnableVoteHud)
                 {
-                    _voteCenterHtmlCache = BuildVoteCenterHtml();
+                    RefreshVotePanel();
                 }
                 else
                 {
@@ -3227,8 +3224,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             Log("VOTE", $"{PlayerTag(player)} voted for option {option}: {votedMapName} ({votedMapId})");
             player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{votedMapName}{ColorDefault}");
             // Tallies changed — refresh the panel right away instead of waiting
-            // for the next 0.5s rebuild.
-            if (Config.EnableVoteHud) _voteCenterHtmlCache = BuildVoteCenterHtml();
+            // for the next 0.5s tick.
+            RefreshVotePanel();
             return HookResult.Handled;
         }
         return HookResult.Continue;
@@ -3376,48 +3373,83 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // timed votes) a countdown footer that goes green -> yellow -> red as time
     // runs out. While the panel is on, the chat option list is suppressed.
     //
-    // Rendering: the html is CACHED and rebuilt only when something changes (the
-    // 0.5s vote timer for the countdown/tallies, plus immediately on each cast
-    // vote), while a per-tick listener re-sends the cached string — center-html
-    // hints start fading right away unless constantly re-sent, so anything slower
-    // visibly pulses. Cleared the moment the vote ends.
+    // Transport: PrintToCenterHtml(html, duration) fires the game's survival-
+    // respawn-status event, and that panel persists for the whole duration while a
+    // re-fire with new text swaps the content seamlessly — no fade, no flash. So
+    // instead of hammering re-sends, the panel is sent only when its content
+    // actually changes (tallies, the once-a-second countdown), plus a heartbeat
+    // well inside the duration window so it never expires and late joiners get it.
+    //
+    // Alignment: the panel centers every line individually, which scatters the
+    // option numbers when map names differ in width. Each line is therefore
+    // right-padded with width-estimated non-breaking spaces up to the widest line,
+    // so centering leaves all left edges — and the numbers — in a straight column.
 
     private string _voteCenterHtmlCache = "";
+    private DateTime _voteHudLastSent = DateTime.MinValue;
     private float _voteTotalSeconds;
 
     private static string HtmlEscape(string s)
         => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
+    // Rough proportional-font width in "average glyph" units. Only used to size the
+    // alignment padding, so close is good enough.
+    private static float EstimateHudWidth(string s)
+    {
+        float w = 0f;
+        foreach (char c in s)
+            w += "iljtf!.,:;'|()[] 1".IndexOf(c) >= 0 ? 0.55f
+               : "mwMW@".IndexOf(c) >= 0 ? 1.5f
+               : char.IsUpper(c) || char.IsDigit(c) ? 1.15f : 1.0f;
+        return w;
+    }
+
     private string BuildVoteCenterHtml()
     {
-        var sb = new StringBuilder();
-        sb.Append("<font color='#FFD700'><b>Type a number in chat to vote</b></font>");
+        var rows = new List<(string plain, string html)>
+        {
+            ("Type a number in chat to vote", "<font color='#FFD700'><b>Type a number in chat to vote</b></font>")
+        };
         foreach (var kvp in OrderedVoteOptions())
         {
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
-            sb.Append($"<br><font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(OptionName(kvp.Value))}</font> <font color='#B0B0B0'>({votes})</font>");
+            string name = OptionName(kvp.Value);
+            rows.Add(($"{kvp.Key}: {name} ({votes})",
+                $"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font> <font color='#B0B0B0'>({votes})</font>"));
         }
         if (_voteIsTimed)
         {
             int remaining = VoteSecondsRemaining();
             float frac = _voteTotalSeconds > 0 ? remaining / _voteTotalSeconds : 1f;
             string color = frac > 0.5f ? "#4CAF50" : frac > 0.25f ? "#FFD700" : "#FF4444";
-            sb.Append($"<br><font color='{color}'>{remaining}s remaining</font>");
+            rows.Add(($"{remaining}s remaining", $"<font color='{color}'>{remaining}s remaining</font>"));
+        }
+
+        float maxWidth = rows.Max(r => EstimateHudWidth(r.plain));
+        var sb = new StringBuilder();
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append("<br>");
+            sb.Append(rows[i].html);
+            int pad = (int)Math.Round((maxWidth - EstimateHudWidth(rows[i].plain)) / 0.55f);
+            for (int n = 0; n < pad; n++) sb.Append(' '); // nbsp - plain spaces collapse
         }
         return sb.ToString();
     }
 
-    // Center-html hints fade unless re-sent constantly — sending the cached panel
-    // every tick keeps it rock solid (the same approach CSS's CenterHtmlMenu uses).
-    private void OnVoteHudTick()
+    // Sends the panel to everyone when its content changed (or on the heartbeat /
+    // when forced). Duration comfortably outlives the heartbeat, so the panel is
+    // rock solid between sends and updates without any flash.
+    private void RefreshVotePanel(bool force = false)
     {
-        if (_unloaded || _voteCenterHtmlCache.Length == 0) return;
-        try
-        {
-            foreach (var p in GetHumanPlayers())
-                p.PrintToCenterHtml(_voteCenterHtmlCache);
-        }
-        catch { /* never let a render error hit the tick */ }
+        if (!Config.EnableVoteHud || !_voteInProgress) return;
+        string html = BuildVoteCenterHtml();
+        bool changed = html != _voteCenterHtmlCache;
+        if (!force && !changed && (DateTime.UtcNow - _voteHudLastSent).TotalSeconds < 2.0) return;
+        _voteCenterHtmlCache = html;
+        _voteHudLastSent = DateTime.UtcNow;
+        foreach (var p in GetHumanPlayers())
+            try { p.PrintToCenterHtml(html, 10); } catch { }
     }
 
     private string GetMapName(string mapId)
