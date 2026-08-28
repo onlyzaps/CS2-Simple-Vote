@@ -1,61 +1,83 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace CS2SimpleVote;
 
 // --- Configuration ---
+// Property order mirrors the sectioned layout the plugin writes to disk (see
+// RenderSectionedConfig, which is the single source of truth for the on-disk
+// file: sections, comments, and key order).
 public class VoteConfig : BasePluginConfig
 {
+    // Steam Workshop Collection
     [JsonPropertyName("steam_api_key")] public string SteamApiKey { get; set; } = "YOUR_STEAM_API_KEY_HERE";
     [JsonPropertyName("collection_id")] public string CollectionId { get; set; } = "123456789";
-    [JsonPropertyName("vote_on_round")] public int VoteOnRound { get; set; } = 5;
-    [JsonPropertyName("enable_rtv")] public bool EnableRtv { get; set; } = true;
-    [JsonPropertyName("enable_nominate")] public bool EnableNominate { get; set; } = true;
-    [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 8;
-    [JsonPropertyName("rtv_ratio")] public float RtvRatio { get; set; } = 0.50f;
-    [JsonPropertyName("rtv_change_delay")] public float RtvDelaySeconds { get; set; } = 5.0f;
-    [JsonPropertyName("postmap_change_delay")] public float PostMapChangeDelay { get; set; } = 10.0f;
-    [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 5;
-    [JsonPropertyName("vote_reminder_enabled")] public bool EnableReminders { get; set; } = true;
-    [JsonPropertyName("vote_reminder_interval")] public float ReminderIntervalSeconds { get; set; } = 30.0f;
-    [JsonPropertyName("server_name")] public string ServerName { get; set; } = "My CS2 Server";
-    [JsonPropertyName("enable_map_message")] public bool EnableMapMessage { get; set; } = true;
-    [JsonPropertyName("map_message_interval")] public float CurrentMapMessageInterval { get; set; } = 300.0f;
-    [JsonPropertyName("omit_recent_maps")] public bool OmitRecentMaps { get; set; } = true;
-    [JsonPropertyName("recent_maps_count")] public int RecentMapsCount { get; set; } = 10;
-    [JsonPropertyName("vote_open_for_rounds")] public int VoteOpenForRounds { get; set; } = 3;
-    [JsonPropertyName("show_midvote_progress")] public bool ShowMidVoteProgress { get; set; } = true;
+    [JsonPropertyName("collection_refresh_minutes")] public float CollectionRefreshMinutes { get; set; } = 30.0f;
 
-    // Adds an "Extend Current Map" option to every map vote, selectable with 0 / !0.
-    // If it wins, the next map is set to the current map (replayed at match end).
-    [JsonPropertyName("enable_extend_vote")] public bool EnableExtendVote { get; set; } = false;
-
-    // Renders a live vote-progress panel in the center of the screen (options with
-    // running tallies). While enabled, the plain "VOTE NOW!" center prompt is fully
-    // replaced. Round-based votes flash the panel for 10 seconds at the end of each
-    // round the vote is open and at the vote's conclusion; timed votes keep it up
-    // for the whole vote with a seconds countdown at the top.
-    [JsonPropertyName("enable_vote_hud")] public bool EnableVoteHud { get; set; } = false;
-
-    // Switches scheduled/forced votes from round-based (vote_open_for_rounds) to a
-    // fixed timer of timed_vote_seconds. RTV votes are always timed (30s).
-    [JsonPropertyName("enable_timed_vote")] public bool EnableTimedVote { get; set; } = false;
-    [JsonPropertyName("timed_vote_seconds")] public float TimedVoteSeconds { get; set; } = 60.0f;
-
+    // Admins
     [JsonPropertyName("admins")] public List<ulong> Admins { get; set; } = new();
 
-    // Background collection refresh. The plugin re-fetches the Workshop collection
-    // from Steam on this interval so maps added/removed from the collection are
-    // picked up without a server restart. Set to 0 (or negative) to disable and
-    // only fetch once at load. Minimum enforced interval is 1 minute.
-    [JsonPropertyName("collection_refresh_minutes")] public float CollectionRefreshMinutes { get; set; } = 30.0f;
+    // Scheduled Vote Trigger — the automatic vote starts this many rounds before
+    // the match can end. The end round is derived from mp_maxrounds; when
+    // mp_match_can_clinch is on, the earliest possible end (maxrounds/2 + 1) is
+    // used, when off the full mp_maxrounds is used. 0 disables the scheduled vote.
+    [JsonPropertyName("vote_rounds_before_end")] public int VoteRoundsBeforeEnd { get; set; } = 3;
+
+    // Vote Style — switches between the Timed Vote and Round-Based Vote sections.
+    [JsonPropertyName("enable_timed_vote")] public bool EnableTimedVote { get; set; } = true;
+
+    // Timed Vote
+    [JsonPropertyName("timed_vote_seconds")] public float TimedVoteSeconds { get; set; } = 60.0f;
+
+    // Round-Based Vote
+    [JsonPropertyName("vote_open_for_rounds")] public int VoteOpenForRounds { get; set; } = 3;
+    [JsonPropertyName("show_midvote_progress")] public bool ShowMidVoteProgress { get; set; } = false;
+
+    // Vote Options
+    [JsonPropertyName("enable_extend_vote")] public bool EnableExtendVote { get; set; } = false;
+    [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 5;
+
+    // Vote HUD (center-screen live progress panel; replaces VOTE NOW! and
+    // suppresses chat reminders while enabled)
+    [JsonPropertyName("enable_vote_hud")] public bool EnableVoteHud { get; set; } = false;
+
+    // Vote Reminders
+    [JsonPropertyName("vote_reminder_enabled")] public bool EnableReminders { get; set; } = true;
+    [JsonPropertyName("vote_reminder_interval")] public float ReminderIntervalSeconds { get; set; } = 30.0f;
+
+    // Rock the Vote
+    [JsonPropertyName("enable_rtv")] public bool EnableRtv { get; set; } = true;
+    [JsonPropertyName("rtv_ratio")] public float RtvRatio { get; set; } = 0.6f;
+    [JsonPropertyName("rtv_change_delay")] public float RtvDelaySeconds { get; set; } = 5.0f;
+
+    // Nominations
+    [JsonPropertyName("enable_nominate")] public bool EnableNominate { get; set; } = true;
+    [JsonPropertyName("nominate_per_page")] public int NominatePerPage { get; set; } = 8;
+
+    // Recent Map Exclusion
+    [JsonPropertyName("omit_recent_maps")] public bool OmitRecentMaps { get; set; } = true;
+    [JsonPropertyName("recent_maps_count")] public int RecentMapsCount { get; set; } = 10;
+
+    // Current Map Message
+    [JsonPropertyName("enable_map_message")] public bool EnableMapMessage { get; set; } = true;
+    [JsonPropertyName("show_server_name_in_map_message")] public bool ShowServerNameInMapMessage { get; set; } = true;
+    [JsonPropertyName("map_message_interval")] public float CurrentMapMessageInterval { get; set; } = 300.0f;
+    [JsonPropertyName("server_name")] public string ServerName { get; set; } = "My CS2 Server";
+
+    // Map Change
+    [JsonPropertyName("postmap_change_delay")] public float PostMapChangeDelay { get; set; } = 10.0f;
+
+    // Managed by the plugin: the game build (from steam.inf) the stock map list
+    // was last synced against. Stock maps re-sync from the engine only when this
+    // differs from the running build.
+    [JsonPropertyName("last_synced_build")] public int LastSyncedBuild { get; set; } = 0;
 }
 
 public class MapItem
@@ -87,7 +109,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.5.0";
+    public override string ModuleVersion => "1.6.0";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -208,6 +230,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private string _configFilePath = "";
     private string _engineMapsDir = "";
     private string _engineLocalizationPath = "";
+    private string _engineSteamInfPath = "";
 
     // Cancellation for background task
     private CancellationTokenSource _cts = new();
@@ -234,12 +257,14 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private void ValidateConfig()
     {
         Config.VoteOptionsCount = Math.Clamp(Config.VoteOptionsCount, 2, 10);
-        if (Config.NominatePerPage < 1) Config.NominatePerPage = 6;
+        if (Config.NominatePerPage < 1) Config.NominatePerPage = 8;
         // rtv_ratio is a fraction of connected players (0–1]. Clamp bad values so a
         // config typo like 60 (instead of 0.60) can't make RTV impossible.
         if (Config.RtvRatio <= 0f) Config.RtvRatio = 0.60f;
         if (Config.RtvRatio > 1f) Config.RtvRatio = 1f;
         if (Config.RecentMapsCount < 0) Config.RecentMapsCount = 0;
+        if (Config.VoteRoundsBeforeEnd < 0) Config.VoteRoundsBeforeEnd = 0;
+        if (Config.LastSyncedBuild < 0) Config.LastSyncedBuild = 0;
         Config.TimedVoteSeconds = Math.Clamp(Config.TimedVoteSeconds, 10.0f, 600.0f);
         // Enforce a sane floor so a mistyped tiny value can't hammer the Steam API.
         if (Config.CollectionRefreshMinutes > 0 && Config.CollectionRefreshMinutes < 1.0f)
@@ -306,48 +331,180 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Console.WriteLine("[CS2SimpleVote] Config reloaded from disk.");
     }
 
-    // Keys that existed in older versions and are no longer part of the config schema.
-    // Includes the removed disco feature and the pre-rename keys.
-    private static readonly string[] LegacyConfigKeys =
-    {
-        "disco_party",
-        "vote_round",          // -> vote_on_round
-        "rtv_percentage",      // -> rtv_ratio
-        "enable_recent_maps",  // -> omit_recent_maps
-        "show_map_message"     // -> enable_map_message
-    };
+    // --- Sectioned config generation ---
+    // The plugin owns the layout of CS2SimpleVote.json: keys grouped into feature
+    // sections with instructions above each one. CounterStrikeSharp deserializes
+    // with comment-skipping enabled (its own generated configs start with a //
+    // header), so the comments are safe. The live file is (re)written whenever it
+    // is missing, predates the sectioned layout, lacks a newly added key, or the
+    // tracked game build changed — always from the CURRENT parsed Config, so hand
+    // edits are never lost. A pristine defaults copy is kept alongside it as
+    // CS2SimpleVote.example.json.
 
-    // Surgically deletes stale keys from CS2SimpleVote.json without touching anything
-    // else (values, ordering, or unknown keys the user may have added). Only rewrites
-    // the file if something was actually removed.
-    private void StripLegacyConfigKeys()
+    private const string ConfigMarker = "CS2SimpleVote Configuration";
+
+    private static string RenderSectionedConfig(VoteConfig c)
     {
-        if (string.IsNullOrEmpty(_configFilePath) || !File.Exists(_configFilePath)) return;
+        static string J(object v) => JsonSerializer.Serialize(v);
+        var sb = new StringBuilder();
+        void Section(string title, params string[] lines)
+        {
+            sb.AppendLine();
+            sb.AppendLine("    // ----------------------------------------------------------------");
+            sb.AppendLine($"    // {title}");
+            sb.AppendLine("    // ----------------------------------------------------------------");
+            foreach (var l in lines) sb.AppendLine($"    // {l}");
+        }
+        void Key(string name, object value) => sb.AppendLine($"    \"{name}\": {J(value)},");
+
+        sb.AppendLine("// ================================================================");
+        sb.AppendLine($"//  {ConfigMarker}");
+        sb.AppendLine("// ================================================================");
+        sb.AppendLine("//  - Edits apply automatically on the next map change (no reload).");
+        sb.AppendLine("//  - Comments are safe to keep; the loader ignores them.");
+        sb.AppendLine("//  - CS2SimpleVote.example.json holds the pristine defaults and is");
+        sb.AppendLine("//    regenerated every load (edits there are ignored).");
+        sb.AppendLine("{");
+
+        Section("Steam Workshop Collection",
+            "The map pool is pulled from this Workshop collection and re-synced",
+            "every collection_refresh_minutes (0 = fetch once at load; minimum 1).",
+            "A Steam Web API key is required: https://steamcommunity.com/dev/apikey");
+        Key("steam_api_key", c.SteamApiKey);
+        Key("collection_id", c.CollectionId);
+        Key("collection_refresh_minutes", c.CollectionRefreshMinutes);
+
+        Section("Admins",
+            "SteamID64s allowed to use admin commands (!forcemap, !omitmap, ...).",
+            "Example: \"admins\": [76561198000000000, 76561198000000001]");
+        Key("admins", c.Admins);
+
+        Section("Scheduled Vote Trigger",
+            "The automatic map vote opens vote_rounds_before_end rounds before the",
+            "match can end. The end round comes from mp_maxrounds: with",
+            "mp_match_can_clinch enabled the earliest possible end (maxrounds/2 + 1)",
+            "is used; with clinching disabled every round plays, so the full",
+            "mp_maxrounds is used instead. 0 disables the scheduled vote (RTV and",
+            "admin votes still work). Requires mp_maxrounds > 0.");
+        Key("vote_rounds_before_end", c.VoteRoundsBeforeEnd);
+
+        Section("Vote Style (switches between the two sections below)",
+            "true  = Timed Vote: the vote runs for a fixed number of seconds and",
+            "        is never interrupted by round changes.",
+            "false = Round-Based Vote: the vote stays open across round ends.",
+            "RTV votes are always timed (30 seconds) regardless of this setting.");
+        Key("enable_timed_vote", c.EnableTimedVote);
+
+        Section("Timed Vote",
+            "How long a timed vote stays open, in seconds (10-600).");
+        Key("timed_vote_seconds", c.TimedVoteSeconds);
+
+        Section("Round-Based Vote",
+            "vote_open_for_rounds: how many rounds the vote stays open.",
+            "show_midvote_progress: print running tallies in chat at round ends.",
+            "Round-based votes only - it does nothing for timed votes.");
+        Key("vote_open_for_rounds", c.VoteOpenForRounds);
+        Key("show_midvote_progress", c.ShowMidVoteProgress);
+
+        Section("Vote Options",
+            "enable_extend_vote: adds \"[0] Extend Current Map\" to every vote",
+            "(players type 0 or !0). If it wins, the next map is the current one.",
+            "vote_options_count: number of maps offered per vote (2-10).");
+        Key("enable_extend_vote", c.EnableExtendVote);
+        Key("vote_options_count", c.VoteOptionsCount);
+
+        Section("Vote HUD",
+            "Live center-screen progress panel: every option with its running",
+            "tally, rendered natively (no extra plugins). Fully replaces the",
+            "plain \"VOTE NOW!\" prompt and suppresses chat vote reminders while",
+            "enabled. Round-based votes flash the panel for 10s at each round end",
+            "and at the vote's conclusion; timed votes keep it up for the whole",
+            "vote with a seconds countdown at the top.");
+        Key("enable_vote_hud", c.EnableVoteHud);
+
+        Section("Vote Reminders",
+            "Chat reminder (with the option list) for players who haven't voted,",
+            "every vote_reminder_interval seconds. Ignored while enable_vote_hud",
+            "is on - the HUD replaces it.");
+        Key("vote_reminder_enabled", c.EnableReminders);
+        Key("vote_reminder_interval", c.ReminderIntervalSeconds);
+
+        Section("Rock the Vote (RTV)",
+            "rtv_ratio: fraction of connected players required to trigger (0-1].",
+            "rtv_change_delay: seconds before the winning map loads.");
+        Key("enable_rtv", c.EnableRtv);
+        Key("rtv_ratio", c.RtvRatio);
+        Key("rtv_change_delay", c.RtvDelaySeconds);
+
+        Section("Nominations",
+            "Players nominate maps into the next vote with !nominate.");
+        Key("enable_nominate", c.EnableNominate);
+        Key("nominate_per_page", c.NominatePerPage);
+
+        Section("Recent Map Exclusion",
+            "Keeps the last recent_maps_count played maps out of votes and",
+            "nominations entirely.");
+        Key("omit_recent_maps", c.OmitRecentMaps);
+        Key("recent_maps_count", c.RecentMapsCount);
+
+        Section("Current Map Message",
+            "Periodic chat message announcing the current map. When",
+            "show_server_name_in_map_message is true it reads",
+            "\"You're playing <map> on <server_name>!\", otherwise just",
+            "\"You're playing <map>!\".");
+        Key("enable_map_message", c.EnableMapMessage);
+        Key("show_server_name_in_map_message", c.ShowServerNameInMapMessage);
+        Key("map_message_interval", c.CurrentMapMessageInterval);
+        Key("server_name", c.ServerName);
+
+        Section("Map Change",
+            "Seconds after the match ends before the winning map loads (max 15).");
+        Key("postmap_change_delay", c.PostMapChangeDelay);
+
+        Section("Managed by the plugin - do not edit",
+            "last_synced_build: the game build (steam.inf) the stock map list was",
+            "last synced against. ConfigVersion: used by CounterStrikeSharp.");
+        Key("last_synced_build", c.LastSyncedBuild);
+        sb.AppendLine($"    \"ConfigVersion\": {c.Version}");
+
+        sb.Append('}');
+        return sb.ToString();
+    }
+
+    // Writes the live sectioned config (preserving current values) when needed, and
+    // always keeps CS2SimpleVote.example.json in sync with the plugin's defaults.
+    private void GenerateConfigFiles(bool force)
+    {
+        try
+        {
+            string text = File.Exists(_configFilePath) ? File.ReadAllText(_configFilePath) : "";
+            string rendered = RenderSectionedConfig(Config);
+
+            // Keys come from the renderer itself, so this can never drift from the
+            // real schema: a key the file lacks (new in this version) forces a
+            // rewrite that adds it with its current (default) value.
+            bool missingKey = false;
+            using (var doc = JsonDocument.Parse(rendered, new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip }))
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                    if (!text.Contains($"\"{prop.Name}\"")) { missingKey = true; break; }
+
+            if (force || missingKey || !text.Contains(ConfigMarker))
+            {
+                File.WriteAllText(_configFilePath, rendered);
+                Console.WriteLine("[CS2SimpleVote] Wrote sectioned CS2SimpleVote.json (existing values preserved).");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not write sectioned config: {ex.Message}"); }
 
         try
         {
-            string json = File.ReadAllText(_configFilePath);
-            var node = JsonNode.Parse(json, documentOptions: new JsonDocumentOptions
-            {
-                CommentHandling = JsonCommentHandling.Skip,
-                AllowTrailingCommas = true
-            });
-            if (node is not JsonObject obj) return;
-
-            var removed = new List<string>();
-            foreach (var key in LegacyConfigKeys)
-                if (obj.Remove(key)) removed.Add(key);
-
-            if (removed.Count == 0) return;
-
-            string cleaned = obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(_configFilePath, cleaned);
-            Console.WriteLine($"[CS2SimpleVote] Removed legacy config key(s): {string.Join(", ", removed)}.");
+            string examplePath = Path.Combine(Path.GetDirectoryName(_configFilePath) ?? "", "CS2SimpleVote.example.json");
+            string example = RenderSectionedConfig(new VoteConfig());
+            string old = File.Exists(examplePath) ? File.ReadAllText(examplePath) : "";
+            if (!string.Equals(old, example, StringComparison.Ordinal))
+                File.WriteAllText(examplePath, example);
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[CS2SimpleVote] Could not clean legacy config keys: {ex.Message}");
-        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not write example config: {ex.Message}"); }
     }
 
     public override void Load(bool hotReload)
@@ -387,21 +544,37 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         string csgoDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "../../../.."));
         _engineMapsDir = Path.Combine(csgoDir, "maps");
         _engineLocalizationPath = Path.Combine(csgoDir, "resource", "csgo_english.txt");
+        _engineSteamInfPath = Path.Combine(csgoDir, "steam.inf");
         _logBaseDir = Path.Combine(configDir, "logs");
         try { Directory.CreateDirectory(_logBaseDir); } catch { /* non-fatal */ }
-
-        // Remove keys left over from older versions (CounterStrikeSharp merges its
-        // generated config into the existing file and never deletes stale keys, so
-        // e.g. disco_party and the pre-rename keys would otherwise linger forever).
-        StripLegacyConfigKeys();
 
         // Clear existing memory state before loading
         _recentMaps.Clear();
 
         // 1. Load Data Immediately (Sync)
         LoadMapHistory();
-        LoadEngineMapTitles();
         MigrateLegacyFiles(configDir);
+
+        // Stock maps re-sync from the engine only when the game build changed
+        // (steam.inf), so Valve's seasonal adds/removals land exactly once per
+        // game update: new maps appear disabled, removed maps are deleted.
+        int build = ReadEngineBuild();
+        bool buildChanged = build == 0 || build != Config.LastSyncedBuild;
+        if (buildChanged)
+        {
+            LoadEngineMapTitles();
+            SyncStockMapsConfig();
+            if (build > 0 && build != Config.LastSyncedBuild)
+            {
+                Log("STOCK", $"Game build changed ({Config.LastSyncedBuild} -> {build}) — stock map list re-synced from the engine.");
+                Config.LastSyncedBuild = build;
+            }
+        }
+
+        // (Re)generate the sectioned config and the pristine example file. Forced
+        // when a new build number must be persisted into last_synced_build.
+        GenerateConfigFiles(force: buildChanged && build > 0);
+
         RefreshMapPools(force: true);
 
         // 3. Start Background Update (initial load), then schedule periodic refresh.
@@ -645,9 +818,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         ReloadConfigFromDisk();
 
         // Re-read every hand-editable map file so manual edits to collection_maps.json
-        // / workshop_maps.json / stock_maps.json are picked up without a reload. The
-        // stock sync also rescans the engine's maps folder, so maps added/removed by
-        // a game update flow in automatically.
+        // / workshop_maps.json / stock_maps.json are picked up without a reload.
+        // (The stock ENGINE scan itself only runs at plugin launch on a build change.)
         RefreshMapPools(force: true);
 
         // Always resolve which workshop item we're now playing (consumes _expectedMapId),
@@ -661,7 +833,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 if (_unloaded) return;
                 // Prefer the resolved workshop title; fall back to the engine map name
                 string displayMapName = GetMapName(_currentMapId ?? mapName);
-                Server.PrintToChatAll($" {ColorDefault}You're playing {ColorGreen}{displayMapName}{ColorDefault} on {ColorGreen}{Config.ServerName}{ColorDefault}!");
+                Server.PrintToChatAll(Config.ShowServerNameInMapMessage
+                    ? $" {ColorDefault}You're playing {ColorGreen}{displayMapName}{ColorDefault} on {ColorGreen}{Config.ServerName}{ColorDefault}!"
+                    : $" {ColorDefault}You're playing {ColorGreen}{displayMapName}{ColorDefault}!");
             }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
         }
     }
@@ -859,22 +1033,73 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // every vote and menu so realtime edits are always honored. The throttle bounds
     // disk reads on player-spammable paths (!nominate etc.); vote starts and admin
     // mutations pass force: true and always see the latest files.
+    // First-launch templates: an empty list plus commented syntax so hand-editing
+    // needs no guesswork. Comments are skipped by the tolerant reader, and both
+    // files are replaced with real data the first time the plugin writes them.
+    private const string CollectionMapsTemplate =
+        "[\n" +
+        "  // collection_maps.json — auto-synced from your Steam Workshop collection.\n" +
+        "  // This file fills itself in on the first successful fetch. You only manage\n" +
+        "  // the \"enabled\" flags (false = omitted from votes); membership and titles\n" +
+        "  // always follow the collection, so hand-added lines here get pruned.\n" +
+        "  // Syntax:\n" +
+        "  //   { \"id\": \"3070321328\", \"title\": \"Dust2 Remake\", \"enabled\": true }\n" +
+        "]";
+
+    private const string WorkshopMapsTemplate =
+        "[\n" +
+        "  // workshop_maps.json — YOUR manually added workshop maps, one per line\n" +
+        "  // (!addmap writes here too). \"title\" may be left \"\" — it auto-fills from\n" +
+        "  // Steam on the next collection refresh. \"enabled\": false omits the map.\n" +
+        "  // Syntax (uncomment and fill in the id to add a map):\n" +
+        "  //   { \"id\": \"\", \"title\": \"\", \"enabled\": true }\n" +
+        "]";
+
+    private void WriteTemplateIfMissing(string path, string template, string label)
+    {
+        try
+        {
+            if (File.Exists(path)) return;
+            File.WriteAllText(path, template);
+            Console.WriteLine($"[CS2SimpleVote] Generated {label} template.");
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not generate {label}: {ex.Message}"); }
+    }
+
     private void RefreshMapPools(bool force = false)
     {
         if (!force && (DateTime.UtcNow - _lastPoolsRefresh).TotalSeconds < 2.0) return;
         _lastPoolsRefresh = DateTime.UtcNow;
 
-        SyncStockMapsConfig();
+        // Stock maps: the engine scan runs only at plugin launch (and only when the
+        // game build changed) — here we just re-read the file so hand-edited
+        // "enabled" flags apply in realtime. A deleted file is regenerated from the
+        // engine on the spot.
+        if (!File.Exists(_stockMapsFilePath))
+        {
+            if (_engineMapTitles.Count == 0) LoadEngineMapTitles();
+            SyncStockMapsConfig();
+        }
+        else
+        {
+            _stockMaps = LoadStockMapsFile();
+        }
 
         // collection_maps.json is engine-owned (membership comes from Steam), so if
         // the user deletes it, regenerate it from memory instead of dropping the
         // whole collection pool until the next fetch cycle. workshop_maps.json is
-        // fully hand-owned — deleting it genuinely means "clear my manual list".
-        if (!File.Exists(_collectionMapsFilePath) && _collectionMaps.Count > 0)
-            WriteTrackedFile(_collectionMapsFilePath, _collectionMaps, "collection_maps.json");
-        else
-            _collectionMaps = LoadTrackedFile(_collectionMapsFilePath, "collection_maps.json", _collectionMaps);
+        // fully hand-owned — deleting it genuinely means "clear my manual list",
+        // and it comes back as the commented template.
+        if (!File.Exists(_collectionMapsFilePath))
+        {
+            if (_collectionMaps.Count > 0)
+                WriteTrackedFile(_collectionMapsFilePath, _collectionMaps, "collection_maps.json");
+            else
+                WriteTemplateIfMissing(_collectionMapsFilePath, CollectionMapsTemplate, "collection_maps.json");
+        }
+        _collectionMaps = LoadTrackedFile(_collectionMapsFilePath, "collection_maps.json", _collectionMaps);
 
+        WriteTemplateIfMissing(_workshopMapsFilePath, WorkshopMapsTemplate, "workshop_maps.json");
         _workshopMaps = LoadTrackedFile(_workshopMapsFilePath, "workshop_maps.json", _workshopMaps);
         RebuildAvailableMaps();
     }
@@ -1001,14 +1226,38 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- Stock Maps (stock_maps.json) ---
     // The stock map pool is generated straight from the server engine, not curated by
     // hand: map names come from the .vpk files in the game's maps/ folder, display
-    // titles from the SFUI_Map_* entries in resource/csgo_english.txt. The config is
-    // resynced on every load and map start, so seasonal adds/removals shipped by a
-    // game update appear/disappear automatically — new maps are written disabled, and
-    // hand-edited "enabled" flags are always preserved. The file is one entry per line:
+    // titles from the SFUI_Map_* entries in resource/csgo_english.txt. The engine
+    // sync runs at plugin launch, and only when the game build (steam.inf) differs
+    // from last_synced_build in the main config — so a Valve update lands exactly
+    // once: new maps are written disabled, removed maps are deleted, and hand-edited
+    // "enabled" flags are always preserved. Between syncs the file itself is the
+    // source of truth and is re-read live. One entry per line:
     //   { "map": "de_dust2", "title": "Dust II", "enabled": false },
     // sorted by prefix (ar_, cs_, de_, ...) then alphabetically.
 
     private static readonly Regex SfuiMapTitleRegex = new("^\\s*\"SFUI_Map_([^\"]+)\"\\s+\"(.+)\"", RegexOptions.Compiled);
+
+    // Reads the game build number from the engine's steam.inf (ServerVersion=NNNNN).
+    // Returns 0 when unavailable — the caller then falls back to syncing stock maps
+    // every launch rather than never.
+    private int ReadEngineBuild()
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_engineSteamInfPath) || !File.Exists(_engineSteamInfPath)) return 0;
+            foreach (var line in File.ReadLines(_engineSteamInfPath))
+            {
+                if ((line.StartsWith("ServerVersion=", StringComparison.OrdinalIgnoreCase) ||
+                     line.StartsWith("ClientVersion=", StringComparison.OrdinalIgnoreCase)) &&
+                    int.TryParse(line[(line.IndexOf('=') + 1)..].Trim(), out int v) && v > 0)
+                {
+                    return v;
+                }
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not read steam.inf: {ex.Message}"); }
+        return 0;
+    }
 
     // Workshop items have purely numeric IDs; stock maps use the engine map name as
     // their Id. This is what routes map changes, omit matching, and current-map checks.
@@ -2843,7 +3092,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         PrintVoteOptionsToAll();
 
-        if (Config.EnableReminders)
+        // Chat reminders are redundant while the center-screen HUD is enabled —
+        // the panel already keeps the options in front of everyone.
+        if (Config.EnableReminders && !Config.EnableVoteHud)
         {
             _reminderTimer = AddTimer(Config.ReminderIntervalSeconds, () => {
                 if (_unloaded) return;
@@ -2896,6 +3147,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _voteInProgress = false; _voteFinished = true; _reminderTimer?.Kill(); _reminderTimer = null;
         _centerMessageTimer?.Kill(); _centerMessageTimer = null;
         _voteEndTimer?.Kill(); _voteEndTimer = null;
+        bool wasTimed = _voteIsTimed;
         _voteIsTimed = false;
         string winningMapId; int voteCount;
 
@@ -2943,7 +3195,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _previousWinningMapId = null;
         _previousWinningMapName = null;
 
-        if (voteCount > 0 && Config.ShowMidVoteProgress)
+        // show_midvote_progress belongs to the round-based vote system — it does
+        // nothing at all for timed votes.
+        if (voteCount > 0 && Config.ShowMidVoteProgress && !wasTimed)
         {
             PrintVoteProgress();
         }
@@ -3107,15 +3361,38 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         }
     }
 
+    // The round the scheduled vote opens on, derived from the match's own rules:
+    // with clinching enabled a team can end the match at maxrounds/2 + 1, so the
+    // vote schedules against that earliest possible end; with clinching disabled
+    // every round is played, so the full mp_maxrounds applies (double the clinch
+    // threshold, give or take the +1). Returns 0 when scheduling is impossible
+    // (feature disabled, or no round limit to schedule against).
+    internal static int ComputeVoteTriggerRound(int maxRounds, bool canClinch, int roundsBeforeEnd)
+    {
+        if (roundsBeforeEnd <= 0 || maxRounds <= 0) return 0;
+        int effectiveEndRound = canClinch ? (maxRounds / 2 + 1) : maxRounds;
+        return Math.Max(1, effectiveEndRound - roundsBeforeEnd);
+    }
+
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
         if (_unloaded) return HookResult.Continue;
         if (_voteFinished || _voteInProgress || _nextMapSetByAdmin) return HookResult.Continue;
-        if (Config.VoteOnRound <= 0) return HookResult.Continue; // 0 disables the scheduled vote entirely
+        if (Config.VoteRoundsBeforeEnd <= 0) return HookResult.Continue; // 0 disables the scheduled vote entirely
+        if (IsWarmup()) return HookResult.Continue;
         try
         {
+            // Cvars are read every round start so live changes to mp_maxrounds /
+            // mp_match_can_clinch are respected without a reload.
+            int maxRounds = ConVar.Find("mp_maxrounds")?.GetPrimitiveValue<int>() ?? 0;
+            bool canClinch = ConVar.Find("mp_match_can_clinch")?.GetPrimitiveValue<bool>() ?? true;
+            int triggerRound = ComputeVoteTriggerRound(maxRounds, canClinch, Config.VoteRoundsBeforeEnd);
+            if (triggerRound <= 0) return HookResult.Continue; // no round limit — nothing to schedule against
+
             var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules;
-            if (rules != null && rules.TotalRoundsPlayed + 1 == Config.VoteOnRound) StartMapVote(isRtv: false);
+            // ">=" rather than "==" so a plugin loaded (or cvars changed) mid-match
+            // still opens the vote at the first round start past the trigger.
+            if (rules != null && rules.TotalRoundsPlayed + 1 >= triggerRound) StartMapVote(isRtv: false);
         }
         catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] OnRoundStart error: {ex.Message}"); }
         return HookResult.Continue;

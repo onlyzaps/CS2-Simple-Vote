@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.5.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.6.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -14,15 +14,15 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 - **Three map sources, one pool** — the Steam Workshop collection (`collection_maps.json`), manually added workshop maps (`workshop_maps.json`), and official stock maps (`stock_maps.json`) all merge into the same vote pool.
 - **Enable/disable per map** — every map is one readable line with an `enabled` flag. Flip it to omit or include the map; that IS the omit system.
 - **Realtime file edits** — all three files are re-read before every vote, nomination, and menu. Edit a flag mid-map and the very next vote honors it.
-- **Auto-synced membership** — the collection file tracks the Steam collection (adds/removals/titles), the stock file tracks the server engine's own map list (seasonal rotations included). Only your `enabled` flags are yours to manage.
+- **Auto-synced membership** — the collection file tracks the Steam collection (adds/removals/titles); the stock file tracks the server engine's own map list, re-synced automatically whenever the game build changes (seasonal rotations land by themselves). Only your `enabled` flags are yours to manage.
 - **Rock the Vote (RTV)** — player-driven votes with a configurable ratio; threshold re-checks when players leave so votes never get stuck.
 - **Nominations** — paged, searchable map nominations with per-player tracking.
-- **Scheduled + forced votes** — auto-vote on a set round, or trigger votes/RTVs on demand as an admin.
+- **Match-aware scheduled votes** — the automatic vote opens `vote_rounds_before_end` rounds before the match can end, computed from `mp_maxrounds` and `mp_match_can_clinch`. No hardcoded round numbers to keep in sync with your server config.
 - **Extend option** — optionally adds `[0] Extend Current Map` to every vote (`0` or `!0` to cast); if it wins, the next map is the current one.
-- **Round-based or timed votes** — scheduled votes stay open for N rounds, or flip one flag to run them on a seconds timer instead.
+- **Round-based or timed votes** — scheduled votes stay open for N rounds, or flip one flag to run them on a seconds timer instead (timed votes are never interrupted by round changes).
 - **Center-screen vote HUD** — optional live progress panel (options + running tallies) rendered natively, no resource plugins. Round-based votes flash it for 10s at each round end and at the vote's conclusion; timed votes keep it up all vote with a countdown.
 - **Recent-map exclusion** — the last `recent_maps_count` played maps are kept out of votes entirely: the random pool *and* nominations. Works for workshop and stock maps alike.
-- **Live config reload** — edit `CS2SimpleVote.json` and it applies on the next map change, no restart.
+- **Self-documenting config** — `CS2SimpleVote.json` is generated sectioned by feature with instructions above every setting, plus a pristine `CS2SimpleVote.example.json` for reference. Edits apply on the next map change, no restart.
 - **Hidden commands** — every command is intercepted silently and never spammed to public chat.
 
 ---
@@ -96,37 +96,69 @@ Run from the **server console**:
 
 Config lives at `addons/counterstrikesharp/configs/plugins/CS2SimpleVote/CS2SimpleVote.json`.
 
+The plugin **generates it for you**, grouped into the sections below with instructions above every setting (comments are safe — the loader skips them). A pristine copy of the defaults, `CS2SimpleVote.example.json`, is regenerated next to it on every load for reference. Hand edits apply on the next map change; your values are always preserved when the plugin refreshes the file layout.
+
+### Steam Workshop Collection
+
 | Key | Default | Description |
 |---|---|---|
-| `steam_api_key` | `"YOUR_STEAM_API_KEY_HERE"` | Steam Web API key (required for collection + `!addmap`) |
+| `steam_api_key` | `"YOUR_STEAM_API_KEY_HERE"` | [Steam Web API key](https://steamcommunity.com/dev/apikey) (required for the collection + `!addmap`) |
 | `collection_id` | `"123456789"` | Workshop collection ID to load maps from |
-| `vote_on_round` | `5` | Round number that triggers the scheduled vote (`0` disables) |
-| `enable_rtv` | `true` | Enable Rock the Vote |
-| `rtv_ratio` | `0.50` | Fraction of players needed to trigger RTV (0–1] |
-| `rtv_change_delay` | `5.0` | Seconds before an RTV winner loads |
-| `enable_nominate` | `true` | Enable nominations |
-| `nominate_per_page` | `8` | Maps shown per nomination page |
-| `vote_options_count` | `5` | Number of maps in a vote (2–10) |
-| `vote_open_for_rounds` | `3` | How many rounds a round-based scheduled vote stays open |
+| `collection_refresh_minutes` | `30` | Minutes between collection re-syncs (`0` = once at load, min 1) |
+
+### Admins
+
+| Key | Default | Description |
+|---|---|---|
+| `admins` | `[]` | SteamID64s allowed to use admin commands |
+
+### Scheduled Vote Trigger
+
+| Key | Default | Description |
+|---|---|---|
+| `vote_rounds_before_end` | `3` | The automatic vote opens this many rounds before the match can end (`0` disables) |
+
+The trigger round is computed from the server's own match rules — nothing to keep in sync by hand:
+
+- **`mp_match_can_clinch 1`** (default): a team can end the match at `mp_maxrounds / 2 + 1`, so the vote schedules against that earliest possible end. `mp_maxrounds 24` → clinch at round 13 → vote opens at round **10**.
+- **`mp_match_can_clinch 0`**: every round plays, so the full `mp_maxrounds` applies (the window doubles). `mp_maxrounds 24` → vote opens at round **21**.
+- Requires `mp_maxrounds > 0`; cvars are re-read every round start, so live changes count.
+
+### Vote Style — `enable_timed_vote` (switches between the two sections below)
+
+| Key | Default | Description |
+|---|---|---|
+| `enable_timed_vote` | `true` | `true` = timed vote (fixed seconds, never interrupted by round changes) · `false` = round-based vote |
+
+RTV votes are always timed (30 seconds) regardless of this setting.
+
+#### Timed Vote
+
+| Key | Default | Description |
+|---|---|---|
+| `timed_vote_seconds` | `60` | How long a timed vote stays open (10–600) |
+
+#### Round-Based Vote
+
+| Key | Default | Description |
+|---|---|---|
+| `vote_open_for_rounds` | `3` | How many rounds the vote stays open |
+| `show_midvote_progress` | `false` | Print running tallies in chat at round ends (round-based votes only — does nothing for timed votes) |
+
+### Vote Options
+
+| Key | Default | Description |
+|---|---|---|
 | `enable_extend_vote` | `false` | Add `[0] Extend Current Map` to votes (`0` / `!0` to cast); winning sets the next map to the current one |
-| `enable_vote_hud` | `false` | Live center-screen progress panel; fully replaces the `VOTE NOW!` prompt |
-| `enable_timed_vote` | `false` | Scheduled/forced votes run on a seconds timer instead of rounds |
-| `timed_vote_seconds` | `60.0` | Timed vote duration in seconds (10–600; RTV votes are always 30s) |
-| `show_midvote_progress` | `true` | Show running tallies in chat during a vote |
-| `vote_reminder_enabled` | `true` | Periodically remind players to vote |
-| `vote_reminder_interval` | `30.0` | Seconds between vote reminders |
-| `postmap_change_delay` | `10.0` | Seconds before an end-of-match winner loads |
-| `omit_recent_maps` | `true` | Keep recently played maps out of the pool |
-| `recent_maps_count` | `10` | How many recent maps to remember/exclude |
-| `enable_map_message` | `true` | Periodically announce the current map |
-| `map_message_interval` | `300.0` | Seconds between current-map messages |
-| `server_name` | `"My CS2 Server"` | Name shown in the current-map message |
-| `collection_refresh_minutes` | `30.0` | Minutes between collection refreshes (`0` = once at load, min 1) |
-| `admins` | `[]` | List of admin SteamID64s |
+| `vote_options_count` | `5` | Number of maps offered per vote (2–10) |
 
-### Vote HUD (`enable_vote_hud`)
+### Vote HUD
 
-A live progress panel in the center of the screen (styled after [cs2-rockthevote](https://github.com/Oz-Lin/cs2-rockthevote)'s vote panel), rendered natively with `PrintToCenterHtml` — nothing external to install:
+| Key | Default | Description |
+|---|---|---|
+| `enable_vote_hud` | `false` | Live center-screen progress panel; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
+
+Rendered natively with `PrintToCenterHtml` (styled after [cs2-rockthevote](https://github.com/Oz-Lin/cs2-rockthevote)'s panel) — nothing external to install:
 
 ```
 Vote for the Next Map!
@@ -136,27 +168,59 @@ Time remaining: 42s        ← timed votes only
 !0 Extend Current Map (0)  ← when enable_extend_vote is on
 ```
 
-While the HUD is enabled the plain `VOTE NOW!` center prompt is never shown. Visibility depends on the vote style:
+- **Round-based votes**: the panel is not up the whole vote — it appears for **10 seconds at the end of every round** the vote is open, and for **10 seconds at the vote's conclusion** (final tally + winner).
+- **Timed votes** (and all RTV votes): the panel stays up for the **entire vote** with a live countdown at the top, then shows the 10-second conclusion panel.
 
-- **Round-based votes** (`enable_timed_vote: false`): the panel is not up the whole vote — it appears for **10 seconds at the end of every round** the vote is open, and for **10 seconds when the vote concludes** (final tally + winner).
-- **Timed votes** (`enable_timed_vote: true`, and all RTV votes): the panel stays up for the **entire vote** with a live seconds countdown at the top, then shows the 10-second conclusion panel.
+### Vote Reminders
 
-### Example `CS2SimpleVote.json`
-```json
-{
-  "steam_api_key": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-  "collection_id": "3070781055",
-  "vote_on_round": 10,
-  "enable_rtv": true,
-  "rtv_ratio": 0.60,
-  "vote_options_count": 8,
-  "omit_recent_maps": true,
-  "recent_maps_count": 5,
-  "server_name": "My CS2 Server",
-  "collection_refresh_minutes": 30.0,
-  "admins": [76561198000000000, 76561198000000001]
-}
-```
+| Key | Default | Description |
+|---|---|---|
+| `vote_reminder_enabled` | `true` | Chat reminder (with the option list) for players who haven't voted — ignored while `enable_vote_hud` is on |
+| `vote_reminder_interval` | `30` | Seconds between reminders |
+
+### Rock the Vote (RTV)
+
+| Key | Default | Description |
+|---|---|---|
+| `enable_rtv` | `true` | Enable Rock the Vote |
+| `rtv_ratio` | `0.6` | Fraction of connected players required to trigger (0–1] |
+| `rtv_change_delay` | `5` | Seconds before the winning map loads |
+
+### Nominations
+
+| Key | Default | Description |
+|---|---|---|
+| `enable_nominate` | `true` | Enable nominations |
+| `nominate_per_page` | `8` | Maps shown per nomination page |
+
+### Recent Map Exclusion
+
+| Key | Default | Description |
+|---|---|---|
+| `omit_recent_maps` | `true` | Keep recently played maps out of votes and nominations |
+| `recent_maps_count` | `10` | How many recent maps to remember/exclude |
+
+### Current Map Message
+
+| Key | Default | Description |
+|---|---|---|
+| `enable_map_message` | `true` | Periodic chat message announcing the current map |
+| `show_server_name_in_map_message` | `true` | `true`: "You're playing X on `server_name`!" · `false`: "You're playing X!" |
+| `map_message_interval` | `300` | Seconds between messages |
+| `server_name` | `"My CS2 Server"` | Name shown when enabled |
+
+### Map Change
+
+| Key | Default | Description |
+|---|---|---|
+| `postmap_change_delay` | `10` | Seconds after match end before the winning map loads (max 15) |
+
+### Managed by the plugin (do not edit)
+
+| Key | Default | Description |
+|---|---|---|
+| `last_synced_build` | `0` | Game build (`steam.inf`) the stock map list was last synced against |
+| `ConfigVersion` | `1` | Used by CounterStrikeSharp |
 
 ---
 
@@ -164,8 +228,12 @@ While the HUD is enabled the plain `VOTE NOW!` center prompt is never shown. Vis
 
 Generated next to the config, all hand-editable:
 
+Everything below is generated automatically on first launch, next to the config, and is hand-editable:
+
 | File | Purpose |
 |---|---|
+| `CS2SimpleVote.json` | Main config — sectioned with instructions above every setting |
+| `CS2SimpleVote.example.json` | Pristine defaults for reference (regenerated every load; edits are ignored) |
 | `collection_maps.json` | Steam collection maps — membership/titles auto-synced, you own the `enabled` flags |
 | `workshop_maps.json` | Manually added workshop maps — yours entirely (`!addmap` writes here) |
 | `stock_maps.json` | Official stock maps — auto-synced from the server engine, you own the `enabled` flags |
@@ -176,7 +244,7 @@ All three map files share the same readable one-entry-per-line format and can be
 
 ### Collection maps (`collection_maps.json`)
 
-Auto-generated from your Steam Workshop collection and kept in sync on every refresh (`collection_refresh_minutes`): new collection maps appear **enabled**, removed maps are pruned, titles follow Steam. Set `"enabled": false` on a line to omit that map from votes without touching the collection.
+Starts as a commented template showing the syntax, then fills itself in from your Steam Workshop collection on the first fetch and stays in sync every refresh (`collection_refresh_minutes`): new collection maps appear **enabled**, removed maps are pruned, titles follow Steam. Set `"enabled": false` on a line to omit that map from votes without touching the collection.
 
 ```json
 [
@@ -187,14 +255,14 @@ Auto-generated from your Steam Workshop collection and kept in sync on every ref
 
 ### Workshop maps (`workshop_maps.json`)
 
-Your personal additions outside the collection — same format as above. Add lines by hand or via `!addmap`; a line with just an `"id"` works immediately (the title auto-fills from Steam on the next refresh). Deleting the file clears your manual list; nothing here is ever pruned automatically.
+Your personal additions outside the collection — same format as above, generated as a commented template with a blank entry to copy. Add lines by hand or via `!addmap`; a line with just an `"id"` works immediately (the title auto-fills from Steam on the next refresh). Deleting the file clears your manual list; nothing here is ever pruned automatically.
 
 ### Stock maps (`stock_maps.json`)
 
-Generated straight from the server engine — map names from the `.vpk` files in the game's `maps/` folder, display titles from the server's own localization (`SFUI_Map_*`). Nothing to curate by hand:
+Generated straight from the server engine — map names from the `.vpk` files in the game's `maps/` folder (vanity and other non-playable vpks excluded), display titles from the server's own localization (`SFUI_Map_*`). Nothing to curate by hand:
 
-- **First run** writes every installed stock map, sorted by prefix (`ar_`, `cs_`, `de_`, ...) then alphabetically, all `"enabled": false`.
-- **Seasonal rotations** are automatic: maps added by a game update appear (disabled) and removed maps are pruned, while your `enabled` edits are always preserved.
+- **First launch** writes every installed stock map, sorted by prefix (`ar_`, `cs_`, `de_`, ...) then alphabetically, all `"enabled": false`.
+- **Valve updates land by themselves**: the engine is re-scanned at plugin launch whenever the game build (`steam.inf`) differs from `last_synced_build` in the main config — new maps appear disabled, removed maps are deleted, and your `enabled` edits are always preserved. No scan runs when the build hasn't changed.
 - Enabled stock maps behave exactly like workshop maps everywhere: votes, RTV, nominations, `!forcemap` / `!setnextmap` (searchable by title *or* map name, e.g. `!nominate de_dust2`), omitting, and the recent-map exclusion.
 
 ```json
@@ -205,7 +273,7 @@ Generated straight from the server engine — map names from the `.vpk` files in
 ]
 ```
 
-> **Upgrading from 1.4 or earlier?** The plugin migrates automatically on first load: `custom_maps.json` becomes `workshop_maps.json`, omit patterns from `omitted_maps.json` are applied as `"enabled": false` flags, and `map_cache.json` seeds `collection_maps.json`. The old files are kept as `.bak`.
+> **Upgrading from an older build?** Everything migrates automatically on first load: `custom_maps.json` becomes `workshop_maps.json`, omit patterns from `omitted_maps.json` are applied as `"enabled": false` flags, `map_cache.json` seeds `collection_maps.json` (old files kept as `.bak`), and a flat `CS2SimpleVote.json` is rewritten into the sectioned layout with your values preserved. The removed `vote_on_round` key is superseded by `vote_rounds_before_end`.
 
 ---
 
