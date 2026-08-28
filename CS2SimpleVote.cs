@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.4";
+    public override string ModuleVersion => "1.7.5";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -605,6 +605,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
+        RegisterListener<Listeners.OnTick>(OnVoteHudTick);
 
         // HookMode.Pre so returning HookResult.Handled suppresses the chat message —
         // plugin commands and vote/menu input are processed but never broadcast.
@@ -808,6 +809,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
+        RemoveListener<Listeners.OnTick>(OnVoteHudTick);
         _voteCenterHtmlCache = "";
 
         if (_playerChatDelegate != null)
@@ -3373,12 +3375,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // timed votes) a countdown footer that goes green -> yellow -> red as time
     // runs out. While the panel is on, the chat option list is suppressed.
     //
-    // Transport: PrintToCenterHtml(html, duration) fires the game's survival-
-    // respawn-status event, and that panel persists for the whole duration while a
-    // re-fire with new text swaps the content seamlessly — no fade, no flash. So
-    // instead of hammering re-sends, the panel is sent only when its content
-    // actually changes (tallies, the once-a-second countdown), plus a heartbeat
-    // well inside the duration window so it never expires and late joiners get it.
+    // Transport: the cached html is re-sent EVERY TICK — exactly what CSS core's
+    // own CenterHtmlMenu does. The display only stays up while it keeps being fed
+    // (the duration parameter does not reliably keep it alive, so sending only on
+    // change leaves visible gaps), while identical re-fires and content swaps are
+    // both seamless — the panel sits rock solid and updates without flashing. The
+    // string itself is rebuilt only on the 0.5s timer and when a vote is cast.
     //
     // Alignment: the panel centers every line individually, which scatters the
     // option numbers when map names differ in width. Each line is therefore
@@ -3386,7 +3388,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // so centering leaves all left edges — and the numbers — in a straight column.
 
     private string _voteCenterHtmlCache = "";
-    private DateTime _voteHudLastSent = DateTime.MinValue;
     private float _voteTotalSeconds;
 
     private static string HtmlEscape(string s)
@@ -3437,19 +3438,23 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         return sb.ToString();
     }
 
-    // Sends the panel to everyone when its content changed (or on the heartbeat /
-    // when forced). Duration comfortably outlives the heartbeat, so the panel is
-    // rock solid between sends and updates without any flash.
+    // Rebuilds the cached panel string; the per-tick listener does the sending.
     private void RefreshVotePanel(bool force = false)
     {
         if (!Config.EnableVoteHud || !_voteInProgress) return;
-        string html = BuildVoteCenterHtml();
-        bool changed = html != _voteCenterHtmlCache;
-        if (!force && !changed && (DateTime.UtcNow - _voteHudLastSent).TotalSeconds < 2.0) return;
-        _voteCenterHtmlCache = html;
-        _voteHudLastSent = DateTime.UtcNow;
-        foreach (var p in GetHumanPlayers())
-            try { p.PrintToCenterHtml(html, 10); } catch { }
+        _voteCenterHtmlCache = BuildVoteCenterHtml();
+    }
+
+    // Feeds the display every tick so it never expires; same string, no flash.
+    private void OnVoteHudTick()
+    {
+        if (_unloaded || _voteCenterHtmlCache.Length == 0) return;
+        try
+        {
+            foreach (var p in GetHumanPlayers())
+                p.PrintToCenterHtml(_voteCenterHtmlCache);
+        }
+        catch { /* never let a render error hit the tick */ }
     }
 
     private string GetMapName(string mapId)
