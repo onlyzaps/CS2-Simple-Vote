@@ -49,6 +49,7 @@ public class VoteConfig : BasePluginConfig
     // Vote HUD (display-only center panel with options + live tallies; replaces
     // VOTE NOW! and suppresses chat reminders while enabled)
     [JsonPropertyName("enable_vote_hud")] public bool EnableVoteHud { get; set; } = false;
+    [JsonPropertyName("hud_font_file")] public string HudFontFile { get; set; } = "";
 
     // Vote Reminders
     [JsonPropertyName("vote_reminder_enabled")] public bool EnableReminders { get; set; } = true;
@@ -111,7 +112,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.8.1";
+    public override string ModuleVersion => "1.8.2";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -234,6 +235,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private string _engineMapsDir = "";
     private string _engineLocalizationPath = "";
     private string _engineSteamInfPath = "";
+    private string _engineFontsDir = "";
 
     // Cancellation for background task
     private CancellationTokenSource _cts = new();
@@ -427,8 +429,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             "shifts green -> yellow -> red as time runs out. Rendered natively —",
             "no extra plugins. Shown for the whole vote, hidden the moment it",
             "ends. While enabled it replaces the plain \"VOTE NOW!\" prompt, the",
-            "chat option list, and chat vote reminders.");
+            "chat option list, and chat vote reminders.",
+            "hud_font_file: the panel's column alignment is computed from real font",
+            "metrics read out of the game's own font file. Leave empty to auto-",
+            "detect it under csgo/panorama/fonts; set a filename (or full path) to",
+            "override. The console logs which font was measured at load.");
         Key("enable_vote_hud", c.EnableVoteHud);
+        Key("hud_font_file", c.HudFontFile);
 
         Section("Vote Reminders",
             "Chat reminder (with the option list) for players who haven't voted,",
@@ -552,6 +559,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // actually contains a maps/ folder wins, and the choice is logged so a
         // missing stock_maps.json is diagnosable from the console.
         ResolveEngineDirs();
+        LoadFontMetrics();
         _logBaseDir = Path.Combine(configDir, "logs");
         try { Directory.CreateDirectory(_logBaseDir); } catch { /* non-fatal */ }
 
@@ -1300,6 +1308,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _engineMapsDir = Path.Combine(csgoDir, "maps");
         _engineLocalizationPath = Path.Combine(csgoDir, "resource", "csgo_english.txt");
         _engineSteamInfPath = Path.Combine(csgoDir, "steam.inf");
+        _engineFontsDir = Path.Combine(csgoDir, "panorama", "fonts");
     }
 
     // Reads the game build number from the engine's steam.inf (ServerVersion=NNNNN).
@@ -3522,12 +3531,181 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         334, 260, 334, 584                                                              // {|}~
     };
 
+    // Advance widths measured from the game's own font at load (1/1000 em, index
+    // c - ' '), or null when the font could not be read — then the Arial table above
+    // is used. This is what makes the padding land on the real glyph widths instead
+    // of an approximation of them.
+    private static float[]? _fontWidths;
+    private static float _fontBulletWidth = 350f;
+
+    // Width of one pad character; the granularity of the alignment padding.
+    private static float PadUnits => _fontWidths != null ? _fontWidths[0] : NbspUnits;
+
     private static float CharWidth(char c)
     {
-        if (c == PadChar) return NbspUnits;
-        if (c >= ' ' && c <= '~') return GlyphWidths[c - ' '];
-        if (c == '\u2022') return 350f;   // bullet, used by the marquee separator
-        return 556f;                      // unknown glyph: assume average
+        if (c == PadChar) return PadUnits;
+        if (c >= ' ' && c <= '~') return _fontWidths != null ? _fontWidths[c - ' '] : GlyphWidths[c - ' '];
+        if (c == '\u2022') return _fontBulletWidth;
+        return _fontWidths != null ? _fontWidths['n' - ' '] : 556f;
+    }
+
+    // --- Font metrics (sfnt/TrueType tables) ---
+    // Reads advance widths straight out of the panel font: head (unitsPerEm),
+    // hhea/hmtx (advances) and cmap (character -> glyph). Only those few tables are
+    // touched, so .ttf, .otf and CS2's .uifont all work. Any failure leaves the
+    // built-in table in place — alignment degrades, nothing breaks.
+
+    private static ushort BE16(byte[] b, int i) => (ushort)((b[i] << 8) | b[i + 1]);
+    private static uint BE32(byte[] b, int i) => ((uint)b[i] << 24) | ((uint)b[i + 1] << 16) | ((uint)b[i + 2] << 8) | b[i + 3];
+
+    private static int CmapLookup(byte[] f, int sub, char c)
+    {
+        int format = BE16(f, sub);
+        if (format == 4)
+        {
+            int segX2 = BE16(f, sub + 6);
+            int ends = sub + 14, starts = ends + segX2 + 2, deltas = starts + segX2, ranges = deltas + segX2;
+            for (int s = 0; s < segX2; s += 2)
+            {
+                if (BE16(f, ends + s) < c) continue;
+                int start = BE16(f, starts + s);
+                if (start > c) return 0;
+                int delta = (short)BE16(f, deltas + s);
+                int ro = BE16(f, ranges + s);
+                if (ro == 0) return (c + delta) & 0xFFFF;
+                int gi = ranges + s + ro + 2 * (c - start);
+                if (gi + 1 >= f.Length) return 0;
+                int g = BE16(f, gi);
+                return g == 0 ? 0 : (g + delta) & 0xFFFF;
+            }
+            return 0;
+        }
+        if (format == 12)
+        {
+            uint groups = BE32(f, sub + 12);
+            for (uint g = 0; g < groups; g++)
+            {
+                int rec = sub + 16 + (int)g * 12;
+                if (rec + 12 > f.Length) break;
+                uint lo = BE32(f, rec), hi = BE32(f, rec + 4);
+                if (c < lo) break;
+                if (c <= hi) return (int)(BE32(f, rec + 8) + (c - lo));
+            }
+        }
+        return 0;
+    }
+
+    // Returns advance widths in 1/1000 em for ' '..'~' (index 0..94), or null.
+    private static float[]? ReadFontWidths(string path, out float bulletWidth)
+    {
+        bulletWidth = 350f;
+        try
+        {
+            byte[] f = File.ReadAllBytes(path);
+            if (f.Length < 12) return null;
+
+            var tables = new Dictionary<string, int>(StringComparer.Ordinal);
+            int numTables = BE16(f, 4);
+            for (int i = 0; i < numTables; i++)
+            {
+                int rec = 12 + i * 16;
+                if (rec + 16 > f.Length) return null;
+                tables[Encoding.ASCII.GetString(f, rec, 4)] = (int)BE32(f, rec + 8);
+            }
+            if (!tables.TryGetValue("head", out int head) || !tables.TryGetValue("hhea", out int hhea) ||
+                !tables.TryGetValue("hmtx", out int hmtx) || !tables.TryGetValue("cmap", out int cmap))
+                return null;
+
+            int unitsPerEm = BE16(f, head + 18);
+            if (unitsPerEm <= 0) return null;
+            int numHMetrics = BE16(f, hhea + 34);
+            if (numHMetrics <= 0) return null;
+
+            // Prefer a Windows BMP/full subtable, then anything else.
+            int subtables = BE16(f, cmap + 2), best = -1, bestScore = -1;
+            for (int i = 0; i < subtables; i++)
+            {
+                int rec = cmap + 4 + i * 8;
+                if (rec + 8 > f.Length) break;
+                int plat = BE16(f, rec), enc = BE16(f, rec + 2);
+                int off = cmap + (int)BE32(f, rec + 4);
+                if (off <= 0 || off >= f.Length) continue;
+                int score = plat == 3 && enc == 1 ? 3 : plat == 3 && enc == 10 ? 2 : plat == 0 ? 1 : 0;
+                if (score > bestScore) { bestScore = score; best = off; }
+            }
+            if (best < 0) return null;
+
+            float scale = 1000f / unitsPerEm;
+            float Advance(char c)
+            {
+                int g = CmapLookup(f, best, c);
+                if (g <= 0) return -1f;
+                int idx = g < numHMetrics ? g : numHMetrics - 1;
+                int at = hmtx + idx * 4;
+                if (at + 1 >= f.Length) return -1f;
+                return BE16(f, at) * scale;
+            }
+
+            var widths = new float[95];
+            for (int i = 0; i < 95; i++)
+            {
+                float w = Advance((char)(' ' + i));
+                if (w < 0f) return null;      // font can't render plain ASCII — not our font
+                widths[i] = w;
+            }
+            float bullet = Advance('\u2022');
+            if (bullet > 0f) bulletWidth = bullet;
+            return widths;
+        }
+        catch { return null; }
+    }
+
+    // Picks the font to measure: the configured override, else the first plausible
+    // panel font under csgo/panorama/fonts.
+    private string? FindPanelFontFile()
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(Config.HudFontFile))
+            {
+                string configured = Path.IsPathRooted(Config.HudFontFile)
+                    ? Config.HudFontFile
+                    : Path.Combine(_engineFontsDir, Config.HudFontFile);
+                return File.Exists(configured) ? configured : null;
+            }
+            if (string.IsNullOrEmpty(_engineFontsDir) || !Directory.Exists(_engineFontsDir)) return null;
+
+            var files = Directory.EnumerateFiles(_engineFontsDir, "*.*", SearchOption.AllDirectories)
+                .Where(f => f.EndsWith(".ttf", StringComparison.OrdinalIgnoreCase)
+                         || f.EndsWith(".otf", StringComparison.OrdinalIgnoreCase)
+                         || f.EndsWith(".uifont", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            // The panel renders in the HUD's own face; prefer it, then the general UI font.
+            string[] preferred = { "stratum2-bold", "stratum2bold", "stratum2-regular", "stratum2",
+                                   "notosans-bold", "notosans-regular", "notosans" };
+            foreach (var want in preferred)
+            {
+                var hit = files.FirstOrDefault(f =>
+                    Path.GetFileNameWithoutExtension(f).Replace("_", "-").Contains(want, StringComparison.OrdinalIgnoreCase));
+                if (hit != null) return hit;
+            }
+            return files.FirstOrDefault();
+        }
+        catch { return null; }
+    }
+
+    private void LoadFontMetrics()
+    {
+        string? path = FindPanelFontFile();
+        if (path == null)
+        {
+            Console.WriteLine("[CS2SimpleVote] Panel font not found — using built-in metrics (vote panel columns may sit a hair off). Set hud_font_file to override.");
+            return;
+        }
+        _fontWidths = ReadFontWidths(path, out _fontBulletWidth);
+        Console.WriteLine(_fontWidths != null
+            ? $"[CS2SimpleVote] Vote panel metrics read from {Path.GetFileName(path)} (space={_fontWidths[0]:0}, M={_fontWidths['M' - ' ']:0} per 1000em)."
+            : $"[CS2SimpleVote] Could not parse {Path.GetFileName(path)} — using built-in metrics.");
     }
 
     private static float EstimateHudWidth(string s)
@@ -3537,14 +3715,21 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         return w;
     }
 
+    // Ticks the marquee pauses at the top of each cycle, so a long name sits still
+    // (first character flush with the column) long enough to be read before it
+    // starts sliding again. 0.25s per tick.
+    private const int MarqueeDwellTicks = 12;
+
     // Returns the name unchanged when it fits the budget; otherwise a window into
     // "name • name • ..." that slides one character per rebuild tick, so long names
-    // scroll continuously (one step per 0.25s tick) while the rest stays put.
+    // scroll continuously (one step per 0.25s tick) while the rest stays put. Each
+    // cycle begins with a MarqueeDwellTicks pause at offset 0.
     private string MarqueeName(string name, float budgetUnits)
     {
         if (EstimateHudWidth(name) <= budgetUnits) return name;
         string cycle = name + " • ";
-        int start = _hudScrollTick % cycle.Length;
+        int phase = _hudScrollTick % (cycle.Length + MarqueeDwellTicks);
+        int start = phase < MarqueeDwellTicks ? 0 : phase - MarqueeDwellTicks;
         var sb = new StringBuilder();
         float w = 0f;
         for (int i = 0; i < cycle.Length; i++)
@@ -3581,7 +3766,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             // width: identical widths + per-line centering == aligned left edges, so
             // the numbers form a straight column (and the tallies align on the right).
             float used = EstimateHudWidth(prefix) + EstimateHudWidth(name) + EstimateHudWidth(tally);
-            int pad = Math.Max(0, (int)Math.Round((HudMaxLineUnits - used) / NbspUnits));
+            int pad = Math.Max(0, (int)Math.Round((HudMaxLineUnits - used) / PadUnits));
 
             sb.Append($"<br><font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font>");
             sb.Append(PadChar, pad);
