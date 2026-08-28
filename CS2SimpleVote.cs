@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.8";
+    public override string ModuleVersion => "1.7.9";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3479,6 +3479,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // scrolling marquee window while the vote number and tally stay intact.
     private const float HudMaxLineUnits = 26f;
 
+    // Rendered width of one &nbsp; in the estimator's units — the granularity of
+    // the alignment padding, and the knob to tune if the column drifts.
+    private const float NbspUnits = 0.5f;
+
     private static string HtmlEscape(string s)
         => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
@@ -3548,13 +3552,18 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // Pad every line to the CONSTANT budget rather than to the widest line of
         // the moment — otherwise each marquee step changes the max width and
         // re-pads every other row, wobbling the whole column.
+        //
+        // The padding MUST be &nbsp; entities: a literal non-breaking space is still
+        // whitespace to the renderer, and a trailing run of it is collapsed before
+        // the <br>, which drops the padding entirely and leaves short lines centered
+        // (ragged numbers). The entity is non-collapsible, so the pad always renders.
         var sb = new StringBuilder();
         for (int i = 0; i < rows.Count; i++)
         {
             if (i > 0) sb.Append("<br>");
             sb.Append(rows[i].html);
-            int pad = (int)Math.Round((HudMaxLineUnits - EstimateHudWidth(rows[i].plain)) / 0.50f);
-            for (int n = 0; n < pad; n++) sb.Append(' '); // nbsp - plain spaces collapse
+            int pad = (int)Math.Round((HudMaxLineUnits - EstimateHudWidth(rows[i].plain)) / NbspUnits);
+            for (int n = 0; n < pad; n++) sb.Append("&nbsp;");
         }
         return sb.ToString();
     }
