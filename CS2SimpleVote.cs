@@ -117,7 +117,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.9.0";
+    public override string ModuleVersion => "1.9.1";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -490,7 +490,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 }),
 
             new("Vote HUD",
-                "A display-only panel in the centre of the screen: a yellow \"type a number to vote\" header, each numbered option with its live tally, and - for timed votes - a countdown footer that shifts green to yellow to red as time runs out. Players still vote by typing the number in chat.",
+                "A display-only panel in the centre of the screen: a yellow \"type a number to vote\" header - carrying, on timed votes, a countdown that shifts green to yellow to red as time runs out - followed by each numbered option with its live tally. Players still vote by typing the number in chat.",
                 new[]
                 {
                     E("enable_vote_hud", c.EnableVoteHud,
@@ -3691,9 +3691,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // A display-only center-screen panel in the style of CS2MenuManager's
     // CenterHtmlMenu, implemented in-house with the native PrintToCenterHtml —
     // no dependency, no entities, no input of its own. A yellow header telling
-    // players to vote in chat, the numbered options with live tallies, and (for
-    // timed votes) a countdown footer that goes green -> yellow -> red as time
-    // runs out. While the panel is on, the chat option list is suppressed.
+    // players to vote in chat — carrying, for timed votes, an inline countdown
+    // that goes green -> yellow -> red as time runs out — followed by the
+    // numbered options with live tallies. The panel deliberately ends on the last
+    // option: any trailing row would sit on top of the chat messages below it.
+    // While the panel is on, the chat option list is suppressed.
     //
     // Transport: the cached html is re-sent EVERY TICK — exactly what CSS core's
     // own CenterHtmlMenu does. The display only stays up while it keeps being fed
@@ -4140,9 +4142,19 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         var sb = new StringBuilder();
 
-        // Header and countdown are left CENTERED (like the reference menu's title):
-        // they carry no padding, so nothing of theirs can be trimmed.
-        sb.Append("<font color='#FFD700'><b>Type a number to vote</b></font>");
+        // The header is left CENTERED (like the reference menu's title): it carries
+        // no padding, so nothing of it can be trimmed. The timed-vote countdown is
+        // appended inline here rather than as its own footer row — an extra row at
+        // the bottom of the panel covers the chat messages underneath it.
+        sb.Append("<font color='#FFD700'><b>Type a number to vote");
+        if (_voteIsTimed)
+        {
+            int remaining = VoteSecondsRemaining();
+            float frac = _voteTotalSeconds > 0 ? remaining / _voteTotalSeconds : 1f;
+            string color = frac > 0.5f ? "#4CAF50" : frac > 0.25f ? "#FFD700" : "#FF4444";
+            sb.Append($" - </b></font><font color='{color}'><b>{remaining}s</b></font>");
+        }
+        else sb.Append("</b></font>");
 
         foreach (var kvp in OrderedVoteOptions())
         {
@@ -4164,14 +4176,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             sb.Append($"<br><font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font>");
             sb.Append(PadChar, pad);
             sb.Append($" <font color='#B0B0B0'>({votes})</font>");
-        }
-
-        if (_voteIsTimed)
-        {
-            int remaining = VoteSecondsRemaining();
-            float frac = _voteTotalSeconds > 0 ? remaining / _voteTotalSeconds : 1f;
-            string color = frac > 0.5f ? "#4CAF50" : frac > 0.25f ? "#FFD700" : "#FF4444";
-            sb.Append($"<br><font color='{color}'>{remaining}s remaining</font>");
         }
 
         return sb.ToString();
