@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.5";
+    public override string ModuleVersion => "1.7.6";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3201,6 +3201,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             {
                 if (Config.EnableVoteHud)
                 {
+                    _hudScrollTick++; // advances the long-name marquee one step
                     RefreshVotePanel();
                 }
                 else
@@ -3389,33 +3390,68 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private string _voteCenterHtmlCache = "";
     private float _voteTotalSeconds;
+    private int _hudScrollTick;
+
+    // The display panel word-wraps at a fixed width that cannot be widened from the
+    // server, and a wrapped line wrecks both the layout and the number column. So
+    // every line is kept under this width budget (in the estimator's units — tuned
+    // against observed wrap points): map names that don't fit are shown through a
+    // scrolling marquee window while the vote number and tally stay intact.
+    private const float HudMaxLineUnits = 26f;
 
     private static string HtmlEscape(string s)
         => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
-    // Rough proportional-font width in "average glyph" units. Only used to size the
-    // alignment padding, so close is good enough.
+    // Rough proportional-font glyph width in "average glyph" units. Used to size
+    // the alignment padding and the marquee window, so close is good enough.
+    private static float CharWidth(char c)
+        => "iljtf!.,:;'|()[] 1".IndexOf(c) >= 0 ? 0.55f
+         : "mwMW@".IndexOf(c) >= 0 ? 1.5f
+         : char.IsUpper(c) || char.IsDigit(c) ? 1.15f : 1.0f;
+
     private static float EstimateHudWidth(string s)
     {
         float w = 0f;
-        foreach (char c in s)
-            w += "iljtf!.,:;'|()[] 1".IndexOf(c) >= 0 ? 0.55f
-               : "mwMW@".IndexOf(c) >= 0 ? 1.5f
-               : char.IsUpper(c) || char.IsDigit(c) ? 1.15f : 1.0f;
+        foreach (char c in s) w += CharWidth(c);
         return w;
+    }
+
+    // Returns the name unchanged when it fits the budget; otherwise a window into
+    // "name • name • ..." that slides one character per rebuild tick, so long names
+    // scroll continuously while the rest of the line stays put.
+    private string MarqueeName(string name, float budgetUnits)
+    {
+        if (EstimateHudWidth(name) <= budgetUnits) return name;
+        string cycle = name + " • ";
+        int start = _hudScrollTick % cycle.Length;
+        var sb = new StringBuilder();
+        float w = 0f;
+        for (int i = 0; i < cycle.Length; i++)
+        {
+            char c = cycle[(start + i) % cycle.Length];
+            float cw = CharWidth(c);
+            if (w + cw > budgetUnits) break;
+            w += cw;
+            sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     private string BuildVoteCenterHtml()
     {
         var rows = new List<(string plain, string html)>
         {
-            ("Type a number in chat to vote", "<font color='#FFD700'><b>Type a number in chat to vote</b></font>")
+            // Short enough (even bold) to never word-wrap in the panel.
+            ("Type a number to vote", "<font color='#FFD700'><b>Type a number to vote</b></font>")
         };
         foreach (var kvp in OrderedVoteOptions())
         {
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
-            string name = OptionName(kvp.Value);
-            rows.Add(($"{kvp.Key}: {name} ({votes})",
+            string prefix = $"{kvp.Key}: ";
+            string tally = $" ({votes})";
+            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally);
+            string name = MarqueeName(OptionName(kvp.Value), budget);
+            rows.Add((prefix + name + tally,
                 $"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font> <font color='#B0B0B0'>({votes})</font>"));
         }
         if (_voteIsTimed)

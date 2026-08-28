@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.7.5-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.7.6-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -166,14 +166,14 @@ RTV votes are always timed (30 seconds) regardless of this setting.
 A display-only panel in the center of the screen, styled like [CS2MenuManager](https://github.com/schwarper/CS2MenuManager)'s CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — **no dependency, no entities, no keys to learn**:
 
 ```
-Type a number in chat to vote      ← yellow header
+Type a number to vote          ← yellow header
 1: Dust II (3)
 2: Mirage (1)
-0: Extend Current Map (0)          ← when enable_extend_vote is on
-42s remaining                      ← timed votes: green → yellow → red
+0: Extend Current Map (0)      ← when enable_extend_vote is on
+42s remaining                  ← timed votes: green → yellow → red
 ```
 
-Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in, stays up for the whole vote, and disappears the moment the vote ends. Updates are **flash-free**: the cached panel is fed to the display every tick (the same approach CounterStrikeSharp's own CenterHtmlMenu uses), which keeps it rock solid — identical re-sends and content swaps are both seamless, so nothing fades or pulses between updates. Lines are width-padded so the **option numbers line up in a straight column**. The countdown footer turns **green** above 50% time left, **yellow** down to 25%, then **red**. While the panel is enabled, the option list is no longer printed into chat (chat still announces the vote and the winner).
+Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in, stays up for the whole vote, and disappears the moment the vote ends. Updates are **flash-free**: the cached panel is fed to the display every tick (the same approach CounterStrikeSharp's own CenterHtmlMenu uses), which keeps it rock solid — identical re-sends and content swaps are both seamless, so nothing fades or pulses between updates. Lines are width-padded so the **option numbers line up in a straight column**, and a map name too long for the panel never word-wraps — it **scrolls marquee-style** through its slot while the number and tally stay fixed. The countdown footer turns **green** above 50% time left, **yellow** down to 25%, then **red**. While the panel is enabled, the option list is no longer printed into chat (chat still announces the vote and the winner).
 
 ### Vote Reminders
 
