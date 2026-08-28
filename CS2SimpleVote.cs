@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.9";
+    public override string ModuleVersion => "1.8.0";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3479,9 +3479,21 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // scrolling marquee window while the vote number and tally stay intact.
     private const float HudMaxLineUnits = 26f;
 
-    // Rendered width of one &nbsp; in the estimator's units — the granularity of
-    // the alignment padding, and the knob to tune if the column drifts.
+    // Rendered width of one pad character in the estimator's units — the
+    // granularity of the alignment padding, and the knob to tune if the column
+    // drifts.
     private const float NbspUnits = 0.5f;
+
+    // Alt+255 (U+00A0), the blank glyph used for padding. Written as an escape so
+    // no file-encoding step can mangle it.
+    //
+    // Placement is what actually matters: a run of blanks at the END of a line is
+    // trimmed by the renderer no matter which blank character it is (that is why
+    // both the literal and the &nbsp; entity silently vanished, leaving the short
+    // rows centered and the numbers ragged). The pad is therefore emitted BETWEEN
+    // the map name and the vote tally, where it is flanked by visible glyphs and
+    // cannot be trimmed.
+    private const char PadChar = '\u00A0';
 
     private static string HtmlEscape(string s)
         => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
@@ -3523,11 +3535,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private string BuildVoteCenterHtml()
     {
-        var rows = new List<(string plain, string html)>
-        {
-            // Short enough (even bold) to never word-wrap in the panel.
-            ("Type a number to vote", "<font color='#FFD700'><b>Type a number to vote</b></font>")
-        };
+        var sb = new StringBuilder();
+
+        // Header and countdown are left CENTERED (like the reference menu's title):
+        // they carry no padding, so nothing of theirs can be trimmed.
+        sb.Append("<font color='#FFD700'><b>Type a number to vote</b></font>");
+
         foreach (var kvp in OrderedVoteOptions())
         {
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
@@ -3538,33 +3551,26 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             // pushes its real width past the others and skews the number column.
             float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally) - 2.0f;
             string name = MarqueeName(OptionName(kvp.Value), budget);
-            rows.Add((prefix + name + tally,
-                $"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font> <font color='#B0B0B0'>({votes})</font>"));
+
+            // Pad BETWEEN the name and the tally so every option row ends up the same
+            // width: identical widths + per-line centering == aligned left edges, so
+            // the numbers form a straight column (and the tallies align on the right).
+            float used = EstimateHudWidth(prefix) + EstimateHudWidth(name) + EstimateHudWidth(tally);
+            int pad = Math.Max(0, (int)Math.Round((HudMaxLineUnits - used) / NbspUnits));
+
+            sb.Append($"<br><font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(name)}</font>");
+            sb.Append(PadChar, pad);
+            sb.Append($" <font color='#B0B0B0'>({votes})</font>");
         }
+
         if (_voteIsTimed)
         {
             int remaining = VoteSecondsRemaining();
             float frac = _voteTotalSeconds > 0 ? remaining / _voteTotalSeconds : 1f;
             string color = frac > 0.5f ? "#4CAF50" : frac > 0.25f ? "#FFD700" : "#FF4444";
-            rows.Add(($"{remaining}s remaining", $"<font color='{color}'>{remaining}s remaining</font>"));
+            sb.Append($"<br><font color='{color}'>{remaining}s remaining</font>");
         }
 
-        // Pad every line to the CONSTANT budget rather than to the widest line of
-        // the moment — otherwise each marquee step changes the max width and
-        // re-pads every other row, wobbling the whole column.
-        //
-        // The padding MUST be &nbsp; entities: a literal non-breaking space is still
-        // whitespace to the renderer, and a trailing run of it is collapsed before
-        // the <br>, which drops the padding entirely and leaves short lines centered
-        // (ragged numbers). The entity is non-collapsible, so the pad always renders.
-        var sb = new StringBuilder();
-        for (int i = 0; i < rows.Count; i++)
-        {
-            if (i > 0) sb.Append("<br>");
-            sb.Append(rows[i].html);
-            int pad = (int)Math.Round((HudMaxLineUnits - EstimateHudWidth(rows[i].plain)) / NbspUnits);
-            for (int n = 0; n < pad; n++) sb.Append("&nbsp;");
-        }
         return sb.ToString();
     }
 
