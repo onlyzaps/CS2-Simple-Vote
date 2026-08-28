@@ -3,10 +3,7 @@ using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
-using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Timers;
-using CounterStrikeSharp.API.Modules.Utils;
-using System.Drawing;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -49,8 +46,8 @@ public class VoteConfig : BasePluginConfig
     [JsonPropertyName("enable_extend_vote")] public bool EnableExtendVote { get; set; } = false;
     [JsonPropertyName("vote_options_count")] public int VoteOptionsCount { get; set; } = 5;
 
-    // Vote HUD (center-screen live progress panel; replaces VOTE NOW! and
-    // suppresses chat reminders while enabled)
+    // Vote HUD (display-only center panel with options + live tallies; replaces
+    // VOTE NOW! and suppresses chat reminders while enabled)
     [JsonPropertyName("enable_vote_hud")] public bool EnableVoteHud { get; set; } = false;
 
     // Vote Reminders
@@ -114,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.1";
+    public override string ModuleVersion => "1.7.2";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -153,15 +150,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // it sets the next map to the current map. Never a real workshop ID or map name.
     private const string ExtendOptionId = "@extend";
 
+
     // State: vote timing / center HUD.
     // _voteIsTimed: this vote ends on a timer (RTV, revote, or enable_timed_vote)
     // rather than on round ends. _voteEndsAtUtc is the absolute deadline — remaining
     // time is always derived from it, so a 0.5s render tick can't drift the countdown.
-    // _voteHudVisibleUntil drives the 10-second menu flash windows in round-based
-    // votes.
     private bool _voteIsTimed;
     private DateTime _voteEndsAtUtc = DateTime.MinValue;
-    private DateTime _voteHudVisibleUntil = DateTime.MinValue;
 
     // State: current map identity.
     // _expectedMapId/Name are set right before EVERY plugin-initiated map change
@@ -422,12 +417,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Key("vote_options_count", c.VoteOptionsCount);
 
         Section("Vote HUD",
-            "Live center-screen progress panel: every option with its running",
-            "tally, rendered natively (no extra plugins). Fully replaces the",
-            "plain \"VOTE NOW!\" prompt and suppresses chat vote reminders while",
-            "enabled. Round-based votes flash the panel for 10s at each round end",
-            "and at the vote's conclusion; timed votes keep it up for the whole",
-            "vote with a seconds countdown at the top.");
+            "Display-only center-screen vote panel: each numbered option with its",
+            "live tally (\"1: Map Name (3)\"), rendered natively — no extra",
+            "plugins. Players vote in chat as usual. Shown for the whole vote,",
+            "hidden the moment it ends. Fully replaces the plain \"VOTE NOW!\"",
+            "prompt and suppresses chat vote reminders while enabled.");
         Key("enable_vote_hud", c.EnableVoteHud);
 
         Section("Vote Reminders",
@@ -616,12 +610,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         AddCommandListener("say", _playerChatDelegate, HookMode.Pre);
         AddCommandListener("say_team", _playerChatDelegate, HookMode.Pre);
 
-        // The voice-commands wheel drives the on-screen vote menu: engaged while
-        // +radialradio is held, released on -radialradio. HookMode.Pre + Continue,
-        // so the wheel itself keeps working normally.
-        AddCommandListener("+radialradio", OnRadialRadioDown, HookMode.Pre);
-        AddCommandListener("-radialradio", OnRadialRadioUp, HookMode.Pre);
-
         AddCommand("css_dumpmaps", "Dump all available map names to console", (caller, cmdInfo) =>
         {
             if (caller != null) { cmdInfo.ReplyToCommand("This command can only be used from the server console."); return; }
@@ -766,12 +754,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             RefreshMapPools(force: true);
             cmdInfo.ReplyToCommand($"[CS2SimpleVote] Stock map sync complete: {_stockMaps.Count} stock map(s) tracked ({_stockMaps.Count(e => e.Enabled)} enabled). Maps dir: {_engineMapsDir}");
         });
-
-        // Per-tick driver for the on-screen vote menu (hold SHIFT to interact) and
-        // the transmit filter that keeps each player's menu entities visible only
-        // to them. Registered for the plugin's lifetime; both early-out when idle.
-        RegisterListener<Listeners.OnTick>(OnTickHudInput);
-        RegisterListener<Listeners.CheckTransmit>(OnCheckTransmit);
     }
 
     public override void Unload(bool hotReload)
@@ -824,9 +806,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
-        RemoveListener<Listeners.OnTick>(OnTickHudInput);
-        RemoveListener<Listeners.CheckTransmit>(OnCheckTransmit);
-        DestroyAllScreenMenus();
 
         if (_playerChatDelegate != null)
         {
@@ -834,9 +813,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             RemoveCommandListener("say_team", _playerChatDelegate, HookMode.Pre);
             _playerChatDelegate = null;
         }
-        RemoveCommandListener("+radialradio", OnRadialRadioDown, HookMode.Pre);
-        RemoveCommandListener("-radialradio", OnRadialRadioUp, HookMode.Pre);
-        _voiceMenuHeld.Clear();
 
         // 7. Dispose managed resources and recreate for potential hot reload
         _cts.Dispose();
@@ -894,7 +870,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _previousWinningMapName = null;
         _voteIsTimed = false;
         _voteEndsAtUtc = DateTime.MinValue;
-        _voteHudVisibleUntil = DateTime.MinValue;
 
         _rtvVoters.Clear();
         _playerVotes.Clear();
@@ -925,11 +900,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _mapChangeTimer?.Kill();
         _mapChangeTimer = null;
 
-        // Map change: tear down every screen menu and any leftover outro.
-        _screenOutroUntil = DateTime.MinValue;
-        _screenOutroWinner = "";
-        _voiceMenuHeld.Clear();
-        DestroyAllScreenMenus();
     }
 
     // --- File Persistence ---
@@ -3138,13 +3108,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _currentVoteRoundDuration = 0;
         _playerVotes.Clear(); _activeVoteOptions.Clear(); _nominatingPlayers.Clear(); _playerNominationPage.Clear();
 
-        // A previous vote's 10s outro (or a leftover flash window) must never overlay
-        // the new vote's menu — a revote can start within seconds of the last result.
-        _screenOutroUntil = DateTime.MinValue;
-        _screenOutroWinner = "";
-        _voteHudVisibleUntil = DateTime.MinValue;
-        foreach (var m in _screenMenus.Values) m.LastRenderKey = null;
-
         // Nominations are re-checked against the freshly rebuilt pool AND the
         // recent-map list here, in case a map was disabled (file edit or !omitmap)
         // after it was nominated. This is the final gate — nothing disabled or
@@ -3221,9 +3184,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             {
                 if (Config.EnableVoteHud)
                 {
-                    // The on-screen vote menu fully replaces the VOTE NOW prompt.
-                    // It is entity-based (point_worldtext) and driven per-tick in
-                    // OnTickHudInput — nothing to do here.
+                    // The center vote panel fully replaces the VOTE NOW prompt.
+                    string html = BuildVoteCenterHtml();
+                    foreach (var p in GetHumanPlayers())
+                        p.PrintToCenterHtml(html);
                 }
                 else
                 {
@@ -3314,8 +3278,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Server.PrintToChatAll($" {ColorDefault}Winner: {ColorGreen}{winnerLabel}{ColorDefault}" + (voteCount > 0 ? $" with {ColorGreen}{voteCount}{ColorDefault} votes!" : " (Random/Previous)"));
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
 
-        // Conclusion: keep the on-screen menu up for 10s showing the final tally.
-        StartScreenOutro(winnerLabel);
+        // The panel hides the moment the vote is over.
+        if (Config.EnableVoteHud)
+            foreach (var p in GetHumanPlayers())
+                try { p.PrintToCenterHtml(" "); } catch { }
 
         _nominatedMaps.Clear(); _hasNominatedSteamIds.Clear(); _nominationOwner.Clear(); _nominationNames.Clear();
 
@@ -3374,443 +3340,26 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private int VoteSecondsRemaining()
         => _voteIsTimed ? Math.Max(0, (int)Math.Ceiling((_voteEndsAtUtc - DateTime.UtcNow).TotalSeconds)) : 0;
 
-    // --- Screen vote menu (enable_vote_hud) ---
-    // An on-screen point_worldtext menu, reimplemented in-house from a close read of
-    // CS2ScreenMenuAPI's technique (MIT) and trimmed to exactly what the vote menu
-    // needs — no dependency, no client-side files. The look comes from four layered
-    // worldtext entities at staggered depth offsets, all parented to the player's
-    // predicted viewmodel so the panel is glued to the camera:
-    //   background : every line, translucent gray, DrawBackground=true (the panel)
-    //   dim        : title / countdown / footer lines (soft tan)
-    //   foreground : the numbered option lines (orange)
-    //   highlight  : the selected option only (translucent pale yellow — drawn over
-    //                the orange line it produces a bright "glow" selection)
-    // CheckTransmit strips each player's entities from everyone else's snapshot, so
-    // every player only ever sees their own menu.
-    //
-    // Interaction: the menu is display-only until the player HOLDS SHIFT — that
-    // freezes movement (view stays free) and locks weapon fire, then W/S moves the
-    // selection and E or LMB casts the vote (release-edge, like the reference
-    // implementation). Releasing SHIFT instantly returns control. Typing the option
-    // number in chat always works too.
+    // --- Center vote panel (enable_vote_hud) ---
+    // A display-only center-screen panel in the style of CS2MenuManager's
+    // CenterHtmlMenu, implemented in-house with the native PrintToCenterHtml —
+    // no dependency, no entities, no input of its own. Just the numbered options
+    // with live tallies; players vote in chat as usual. The 0.5s vote render tick
+    // re-sends it (the engine fades center messages otherwise) and it is cleared
+    // the moment the vote ends.
 
-    private const string ScreenMenuFont = "Tahoma Bold";
-    private const int ScreenMenuFontSize = 32;
-    private const float ScreenMenuUnitsPerPx = 0.0085f;
-    private const float ScreenMenuX = -6.55f;   // right-vector offset (left of crosshair)
-    private const float ScreenMenuY = 1.2f;     // up-vector offset
-    private static readonly Color ScreenHighlightColor = Color.FromArgb(127, 255, 255, 64);
-    private static readonly Color ScreenForegroundColor = Color.FromArgb(230, 153, 39);
-    private static readonly Color ScreenDimColor = Color.FromArgb(234, 209, 175);
-    private static readonly Color ScreenBackgroundColor = Color.FromArgb(125, 127, 127, 127);
+    private static string HtmlEscape(string s)
+        => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
-    private class ScreenVoteMenu
+    private string BuildVoteCenterHtml()
     {
-        public CPointWorldText? Background, Dim, Foreground, Highlight;
-        public nint CreatedForPawn = nint.Zero;
-        public int Selection;
-        public bool Engaged;
-        public PlayerButtons LastButtons;
-        public string? LastRenderKey;
-
-        public IEnumerable<CPointWorldText?> Entities()
-        {
-            yield return Background; yield return Dim; yield return Foreground; yield return Highlight;
-        }
-    }
-
-    private readonly Dictionary<int, ScreenVoteMenu> _screenMenus = new();
-    private DateTime _screenOutroUntil = DateTime.MinValue;
-    private string _screenOutroWinner = "";
-
-    // Slots currently holding the voice-commands wheel open (+radialradio held).
-    // The wheel's own client-side cursor appears and the mouse stops turning the
-    // view while it's open, which is exactly the window our menu is driven in.
-    private readonly HashSet<int> _voiceMenuHeld = new();
-
-    private HookResult OnRadialRadioDown(CCSPlayerController? player, CommandInfo info)
-    {
-        if (player != null && player.IsValid) _voiceMenuHeld.Add(player.Slot);
-        return HookResult.Continue;
-    }
-
-    private HookResult OnRadialRadioUp(CCSPlayerController? player, CommandInfo info)
-    {
-        if (player != null && player.IsValid) _voiceMenuHeld.Remove(player.Slot);
-        return HookResult.Continue;
-    }
-
-    // The pawn whose camera the player is looking through (own pawn, or the observed
-    // pawn while dead) — the menu must attach to THAT pawn's viewmodel.
-    private static CCSPlayerPawn? GetViewPawn(CCSPlayerController player)
-    {
-        if (player.Pawn.Value is not CBasePlayerPawn pawn) return null;
-        if (pawn.LifeState == (byte)LifeState_t.LIFE_DEAD)
-        {
-            if (pawn.ObserverServices?.ObserverTarget.Value?.As<CBasePlayerPawn>() is not CBasePlayerPawn observed)
-                return null;
-            pawn = observed;
-        }
-        return pawn.As<CCSPlayerPawn>();
-    }
-
-    // NOTE on attachment: the classic screen-menu trick parented worldtext to the
-    // player's predicted viewmodel, but Valve removed server-side viewmodels from
-    // CS2 (the server schema no longer has CCSPlayer_ViewModelServices/m_hViewModel
-    // at all — verified against a current schema dump). The reference library's own
-    // fallback path is what works today: parent the entities to the view pawn for
-    // PVS/transmit, and re-aim them onto the camera every tick from the pawn's eye
-    // transform (see RepositionScreenMenu, called each tick).
-
-    // Panel transform in front of the camera: eye position + forward*7 with the
-    // side/up offsets scaled for non-90 FOVs, angled to face the player.
-    private static (Vector pos, QAngle ang) ComputeMenuTransform(CCSPlayerController player, CCSPlayerPawn pawn)
-    {
-        QAngle eye = pawn.EyeAngles;
-        Vector forward = new(), right = new(), up = new();
-        NativeAPI.AngleVectors(eye.Handle, forward.Handle, right.Handle, up.Handle);
-
-        float fov = player.DesiredFOV == 0 ? 90 : player.DesiredFOV;
-        float scale = fov == 90 ? 1.0f : (float)Math.Tan(fov / 2 * Math.PI / 180) / (float)Math.Tan(45 * Math.PI / 180);
-
-        Vector pos = pawn.AbsOrigin! + new Vector(0, 0, pawn.ViewOffset.Z)
-                   + forward * 7.0f + right * (ScreenMenuX * scale) + up * (ScreenMenuY * scale);
-        QAngle ang = new() { X = 0, Y = eye.Y + 270.0f, Z = 90.0f - eye.X };
-        return (pos, ang);
-    }
-
-    private static CPointWorldText? CreateMenuText(Color color, bool drawBackground, float depthOffset)
-    {
-        var ent = Utilities.CreateEntityByName<CPointWorldText>("point_worldtext");
-        if (ent is not { IsValid: true }) return null;
-        ent.MessageText = "";
-        ent.Enabled = true;
-        ent.FontName = ScreenMenuFont;
-        ent.FontSize = ScreenMenuFontSize;
-        ent.Fullbright = true;
-        ent.Color = color;
-        ent.WorldUnitsPerPx = ScreenMenuUnitsPerPx;
-        ent.JustifyHorizontal = PointWorldTextJustifyHorizontal_t.POINT_WORLD_TEXT_JUSTIFY_HORIZONTAL_LEFT;
-        ent.JustifyVertical = PointWorldTextJustifyVertical_t.POINT_WORLD_TEXT_JUSTIFY_VERTICAL_TOP;
-        ent.ReorientMode = PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_NONE;
-        ent.RenderMode = RenderMode_t.kRenderNormal;
-        ent.DrawBackground = drawBackground;
-        ent.BackgroundBorderHeight = 0.1f;
-        ent.BackgroundBorderWidth = 0.1f;
-        ent.BackgroundWorldToUV = 0.05f;
-        ent.DepthOffset = depthOffset;
-        ent.DispatchSpawn();
-        return ent;
-    }
-
-    // (Re)creates a player's menu entities when missing or when their view pawn
-    // changed (respawn, spectate switch). Returns false when no view is available.
-    private bool EnsureScreenMenuEntities(CCSPlayerController player, ScreenVoteMenu menu)
-    {
-        var pawn = GetViewPawn(player);
-        if (pawn == null || !pawn.IsValid) return false;
-
-        bool allValid = menu.Entities().All(e => e is { IsValid: true });
-        if (allValid && menu.CreatedForPawn == pawn.Handle) return true;
-
-        DestroyScreenMenuEntities(menu);
-        var (pos, ang) = ComputeMenuTransform(player, pawn);
-
-        // The first worldtext created for a pawn does not render — create and
-        // immediately discard a throwaway one (reference implementation quirk).
-        var warmup = CreateMenuText(ScreenDimColor, false, 0f);
-        if (warmup != null)
-        {
-            warmup.Teleport(pos, ang, null);
-            warmup.AcceptInput("SetParent", pawn, null, "!activator");
-            warmup.Remove();
-        }
-
-        menu.Background = CreateMenuText(ScreenBackgroundColor, true, -0.002f);
-        menu.Dim = CreateMenuText(ScreenDimColor, false, -0.001f);
-        menu.Foreground = CreateMenuText(ScreenForegroundColor, false, 0.000f);
-        menu.Highlight = CreateMenuText(ScreenHighlightColor, false, 0.001f);
-        foreach (var ent in menu.Entities())
-        {
-            if (ent is not { IsValid: true }) continue;
-            ent.Teleport(pos, ang, null);
-            ent.AcceptInput("SetParent", pawn, null, "!activator");
-        }
-        menu.CreatedForPawn = pawn.Handle;
-        menu.LastRenderKey = null;
-        return true;
-    }
-
-    // Re-aims the panel onto the camera every tick (absolute teleport recomputes the
-    // parent-relative offset). This is what keeps the menu glued to the view now
-    // that server-side viewmodels no longer exist to parent to.
-    private void RepositionScreenMenu(CCSPlayerController player, ScreenVoteMenu menu)
-    {
-        var pawn = GetViewPawn(player);
-        if (pawn == null || !pawn.IsValid) return;
-        var (pos, ang) = ComputeMenuTransform(player, pawn);
-        foreach (var ent in menu.Entities())
-            if (ent is { IsValid: true }) ent.Teleport(pos, ang, null);
-    }
-
-    private void DestroyScreenMenuEntities(ScreenVoteMenu menu)
-    {
-        foreach (var ent in menu.Entities())
-            if (ent is { IsValid: true }) ent.Remove();
-        menu.Background = menu.Dim = menu.Foreground = menu.Highlight = null;
-        menu.CreatedForPawn = nint.Zero;
-        menu.LastRenderKey = null;
-    }
-
-    private void DestroyScreenMenu(CCSPlayerController? player, int slot)
-    {
-        if (!_screenMenus.TryGetValue(slot, out var menu)) return;
-        if (menu.Engaged)
-        {
-            menu.Engaged = false;
-            try
-            {
-                var pawn = player?.PlayerPawn.Value;
-                if (pawn != null && pawn.IsValid) UnfreezePawn(pawn);
-            }
-            catch { }
-        }
-        DestroyScreenMenuEntities(menu);
-        _screenMenus.Remove(slot);
-    }
-
-    private void DestroyAllScreenMenus()
-    {
-        foreach (var slot in _screenMenus.Keys.ToList())
-            DestroyScreenMenu(Utilities.GetPlayerFromSlot(slot), slot);
-    }
-
-    // Builds the four text layers. Layers share the line grid — a line a layer does
-    // not draw is an empty line there, so everything stays aligned. Selection shows
-    // as the pale-yellow highlight drawn over the orange option line.
-    private (string bg, string dim, string fg, string hl) BuildVoteMenuLines(int selection, bool engaged)
-    {
-        var bg = new StringBuilder(); var dim = new StringBuilder();
-        var fg = new StringBuilder(); var hl = new StringBuilder();
-        void Line(string text, bool isOption = false, bool isSelected = false)
-        {
-            bg.AppendLine(text);
-            dim.AppendLine(isOption ? "" : text);
-            fg.AppendLine(isOption ? text : "");
-            hl.AppendLine(isSelected ? text : "");
-        }
-
-        bool outro = _screenOutroWinner.Length > 0 && DateTime.UtcNow <= _screenOutroUntil;
-        Line(outro ? "Vote Finished!" : "Vote for the Next Map!");
-        if (!outro && _voteIsTimed) Line($"{VoteSecondsRemaining()}s remaining");
-        Line(" ");
-
-        int i = 0;
+        var sb = new StringBuilder();
         foreach (var kvp in OrderedVoteOptions())
         {
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
-            string text = $"{kvp.Key}. {OptionName(kvp.Value)}  ({votes})";
-            bool selected = outro ? OptionName(kvp.Value) == _screenOutroWinner : (engaged && i == selection);
-            Line(text, isOption: true, isSelected: selected);
-            i++;
+            sb.Append($"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(OptionName(kvp.Value))}</font> <font color='#B0B0B0'>({votes})</font><br>");
         }
-
-        Line(" ");
-        if (outro)
-            Line($"Winner: {_screenOutroWinner}");
-        else
-            Line(engaged ? "W/S move · E to vote · close the wheel to exit"
-                         : "Hold your voice-commands key (Z) to use this menu, or type the number in chat");
-
-        return (bg.ToString(), dim.ToString(), fg.ToString(), hl.ToString());
-    }
-
-    private void RenderScreenMenu(ScreenVoteMenu menu)
-    {
-        var (bg, dim, fg, hl) = BuildVoteMenuLines(menu.Selection, menu.Engaged);
-        string key = $"{bg}{hl}";
-        if (key == menu.LastRenderKey) return;
-        menu.LastRenderKey = key;
-
-        void Apply(CPointWorldText? ent, string text)
-        {
-            if (ent is not { IsValid: true }) return;
-            ent.MessageText = text;
-            Utilities.SetStateChanged(ent, "CPointWorldText", "m_messageText");
-        }
-        Apply(menu.Background, bg);
-        Apply(menu.Dim, dim);
-        Apply(menu.Foreground, fg);
-        Apply(menu.Highlight, hl);
-    }
-
-    private void OnTickHudInput()
-    {
-        if (_unloaded) return;
-        bool outroActive = DateTime.UtcNow <= _screenOutroUntil;
-        bool hudActive = Config.EnableVoteHud && (_voteInProgress || outroActive) && _activeVoteOptions.Count > 0;
-        if (!hudActive)
-        {
-            if (_screenMenus.Count > 0) DestroyAllScreenMenus();
-            if (!outroActive) _screenOutroWinner = "";
-            return;
-        }
-
-        foreach (var player in GetHumanPlayers())
-        {
-            try { TickScreenMenu(player, outroActive); }
-            catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Screen menu tick error: {ex.Message}"); }
-        }
-    }
-
-    private void TickScreenMenu(CCSPlayerController player, bool outroActive)
-    {
-        _screenMenus.TryGetValue(player.Slot, out var menu);
-        // Interaction is held open by the voice-commands wheel: engaged from
-        // +radialradio until -radialradio. The wheel conveniently shows the game's
-        // own mouse cursor client-side and stops the mouse from turning the view.
-        bool voiceHeld = !outroActive && _voiceMenuHeld.Contains(player.Slot) && player.PawnIsAlive;
-
-        // Visibility: outro and timed votes always show; round-based votes show
-        // during the 10s round-end windows, or while the voice wheel is held.
-        bool visible = outroActive || _voteIsTimed || DateTime.UtcNow <= _voteHudVisibleUntil
-                       || voiceHeld || (menu?.Engaged ?? false);
-        if (!visible)
-        {
-            if (menu != null) DestroyScreenMenu(player, player.Slot);
-            return;
-        }
-
-        menu ??= _screenMenus[player.Slot] = new ScreenVoteMenu();
-
-        // Engage/disengage the voice-wheel capture (vote phase only).
-        if (voiceHeld && !menu.Engaged)
-        {
-            var pawn = player.PlayerPawn.Value;
-            if (pawn != null && pawn.IsValid)
-            {
-                menu.Engaged = true;
-                menu.LastButtons = player.Buttons;
-                int rows = _activeVoteOptions.Count;
-                menu.Selection = Math.Clamp(menu.Selection, 0, Math.Max(0, rows - 1));
-                FreezePawn(pawn);
-            }
-        }
-        else if (!voiceHeld && menu.Engaged)
-        {
-            menu.Engaged = false;
-            try
-            {
-                var pawn = player.PlayerPawn.Value;
-                if (pawn != null && pawn.IsValid) UnfreezePawn(pawn);
-            }
-            catch { }
-        }
-
-        if (menu.Engaged)
-        {
-            var pawn = player.PlayerPawn.Value;
-            if (pawn == null || !pawn.IsValid || !player.PawnIsAlive)
-            {
-                menu.Engaged = false;
-            }
-            else
-            {
-                SuppressWeaponFire(pawn);
-                int rows = _activeVoteOptions.Count;
-                var buttons = player.Buttons;
-                // Release-edge input, per the reference implementation.
-                bool Released(PlayerButtons b) => (buttons & b) == 0 && (menu.LastButtons & b) != 0;
-                if (rows > 0)
-                {
-                    if (Released(PlayerButtons.Forward)) menu.Selection = (menu.Selection - 1 + rows) % rows;
-                    else if (Released(PlayerButtons.Back)) menu.Selection = (menu.Selection + 1) % rows;
-                    else if (Released(PlayerButtons.Use) || Released(PlayerButtons.Attack))
-                    {
-                        var options = OrderedVoteOptions().ToList();
-                        if (menu.Selection < options.Count)
-                        {
-                            var kvp = options[menu.Selection];
-                            _playerVotes[player.Slot] = kvp.Key;
-                            string name = OptionName(kvp.Value);
-                            Log("VOTE", $"{PlayerTag(player)} voted (menu) for option {kvp.Key}: {name} ({kvp.Value})");
-                            player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{name}{ColorDefault}");
-                        }
-                    }
-                }
-                menu.LastButtons = buttons;
-            }
-        }
-
-        if (!EnsureScreenMenuEntities(player, menu)) return;
-        RepositionScreenMenu(player, menu);
-        RenderScreenMenu(menu);
-    }
-
-    // Shows the final tally + winner on the menu for 10 seconds after the vote.
-    private void StartScreenOutro(string winnerLabel)
-    {
-        if (!Config.EnableVoteHud) return;
-        _screenOutroWinner = winnerLabel;
-        _screenOutroUntil = DateTime.UtcNow.AddSeconds(10);
-        foreach (var kv in _screenMenus)
-        {
-            var menu = kv.Value;
-            if (menu.Engaged)
-            {
-                menu.Engaged = false;
-                try
-                {
-                    var pawn = Utilities.GetPlayerFromSlot(kv.Key)?.PlayerPawn.Value;
-                    if (pawn != null && pawn.IsValid) UnfreezePawn(pawn);
-                }
-                catch { }
-            }
-            menu.LastRenderKey = null;
-        }
-    }
-
-    // Each player's menu entities are visible only to them.
-    private void OnCheckTransmit(CCheckTransmitInfoList infoList)
-    {
-        if (_screenMenus.Count == 0) return;
-        foreach ((CCheckTransmitInfo info, CCSPlayerController? player) in infoList)
-        {
-            if (player == null) continue;
-            foreach (var kv in _screenMenus)
-            {
-                if (kv.Key == player.Slot) continue;
-                foreach (var ent in kv.Value.Entities())
-                    if (ent is { IsValid: true }) info.TransmitEntities.Remove(ent);
-            }
-        }
-    }
-
-    private static void FreezePawn(CCSPlayerPawn pawn)
-    {
-        // m_nActualMoveType is byte-backed — write the enum (1 byte), not an int.
-        pawn.MoveType = MoveType_t.MOVETYPE_OBSOLETE;
-        Schema.SetSchemaValue(pawn.Handle, "CBaseEntity", "m_nActualMoveType", MoveType_t.MOVETYPE_OBSOLETE);
-        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
-    }
-
-    private static void UnfreezePawn(CCSPlayerPawn pawn)
-    {
-        pawn.MoveType = MoveType_t.MOVETYPE_WALK;
-        Schema.SetSchemaValue(pawn.Handle, "CBaseEntity", "m_nActualMoveType", MoveType_t.MOVETYPE_WALK);
-        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
-    }
-
-    // Push the active weapon's attack ticks into the future so a menu click never
-    // fires the gun. Re-applied every engaged tick; recovers by itself on release.
-    private static void SuppressWeaponFire(CCSPlayerPawn pawn)
-    {
-        var weapon = pawn.WeaponServices?.ActiveWeapon.Value;
-        if (weapon == null || !weapon.IsValid) return;
-        weapon.NextPrimaryAttackTick = Server.TickCount + 64;
-        weapon.NextSecondaryAttackTick = Server.TickCount + 64;
-        Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_nNextPrimaryAttackTick");
-        Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_nNextSecondaryAttackTick");
+        return sb.ToString();
     }
 
     private string GetMapName(string mapId)
@@ -3913,12 +3462,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 {
                     PrintVoteProgress();
                 }
-
-                // Round-based votes flash the progress HUD for 10 seconds at the end
-                // of every round the vote stays open (the 0.5s center tick renders
-                // it while this window is active).
-                if (Config.EnableVoteHud)
-                    _voteHudVisibleUntil = DateTime.UtcNow.AddSeconds(10);
             }
         }
         return HookResult.Continue;
@@ -3960,8 +3503,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             CloseNominationMenu(player);
             CloseForcemapMenu(player);
             CloseSetNextMapMenu(player);
-            _voiceMenuHeld.Remove(player.Slot);
-            DestroyScreenMenu(player, player.Slot);
 
             // A departure lowers the RTV threshold — re-check so the remaining voters
             // aren't left stuck at e.g. 3/3 with no way to trigger the vote.

@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.7.1-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.7.2-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -20,7 +20,7 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 - **Match-aware scheduled votes** — the automatic vote opens `vote_rounds_before_end` rounds before the match can end, computed from `mp_maxrounds` and `mp_match_can_clinch`. No hardcoded round numbers to keep in sync with your server config.
 - **Extend option** — optionally adds `[0] Extend Current Map` to every vote (`0` or `!0` to cast); if it wins, the next map is the current one.
 - **Round-based or timed votes** — scheduled votes stay open for N rounds, or flip one flag to run them on a seconds timer instead (timed votes are never interrupted by round changes).
-- **On-screen vote menu** — optional screen-space menu (options + running tallies) rendered with layered `point_worldtext` entities glued to your camera — reimplemented in-house from the screen-menu technique with zero dependencies and no client files. **Hold your voice-commands key (default Z)** to use it: the game's own cursor appears, movement freezes, W/S moves the highlight, E casts the vote, and your weapon can't fire. Close the wheel and you're instantly back in the game. Round-based votes flash the menu for 10s at each round end and at the vote's conclusion; timed votes keep it up all vote with a countdown.
+- **Center vote panel** — optional display-only panel in the center of the screen listing each numbered option with its live tally (`1: Map Name (3)`), styled like CS2MenuManager's CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — no dependency, no entities, no keys to learn. Players vote in chat as usual; the panel stays up for the whole vote and disappears the moment it ends.
 - **CounterStrikeSharp admin support** — vote admin access via `@css/generic` / `@css/root`; the manual SteamID list still works.
 - **Recent-map exclusion** — the last `recent_maps_count` played maps are kept out of votes entirely: the random pool *and* nominations. Works for workshop and stock maps alike.
 - **Self-documenting config** — `CS2SimpleVote.json` is generated sectioned by feature with instructions above every setting, plus a pristine `CS2SimpleVote.example.json` for reference. Edits apply on the next map change, no restart.
@@ -161,25 +161,17 @@ RTV votes are always timed (30 seconds) regardless of this setting.
 
 | Key | Default | Description |
 |---|---|---|
-| `enable_vote_hud` | `false` | On-screen vote menu; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
+| `enable_vote_hud` | `false` | Center vote panel; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
 
-A screen-space menu built from four layered `point_worldtext` entities parented to your camera — the exact rendering technique of [CS2ScreenMenuAPI](https://github.com/T3Marius/CS2ScreenMenuAPI), reimplemented in-house and trimmed to just the vote menu: **no dependency, no client-side files**. A translucent backdrop panel, soft title/footer text, orange numbered options, and a bright glow over the selected row. Each player only ever sees their own menu (transmit-filtered).
+A display-only panel in the center of the screen, styled like [CS2MenuManager](https://github.com/schwarper/CS2MenuManager)'s CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — **no dependency, no entities, no keys to learn**. Just the numbered options with their live tallies:
 
 ```
-Vote for the Next Map!
-42s remaining                 ← timed votes only
-
-1. Dust II  (3)               ← glows when selected
-2. Mirage  (1)
-0. Extend Current Map  (0)    ← when enable_extend_vote is on
-
-Hold your voice-commands key (Z) to use this menu, or type the number in chat
+1: Dust II (3)
+2: Mirage (1)
+0: Extend Current Map (0)    ← when enable_extend_vote is on
 ```
 
-**Using it**: **hold your voice-commands key** (default **Z** — the radial voice wheel) — the game's own mouse cursor appears and your mouse stops turning your view, movement freezes, and your weapon can't fire. **W/S** moves the selection and **E** casts (or changes) your vote; close the wheel and control returns instantly. Typing the option number in chat always works too. During a round-based vote, holding the key also summons the menu outside its 10-second flash windows.
-
-- **Round-based votes**: the menu is not up the whole vote — it appears for **10 seconds at the end of every round** the vote is open, and for **10 seconds at the vote's conclusion** (final tally with the winner highlighted).
-- **Timed votes** (and all RTV votes): the menu stays up for the **entire vote** with a live countdown, then shows the 10-second conclusion.
+Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in, stays up for the whole vote, and disappears the moment the vote ends. No header, no footer, no input of its own.
 
 ### Vote Reminders
 
