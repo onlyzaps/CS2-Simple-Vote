@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.8.0";
+    public override string ModuleVersion => "1.8.1";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3477,12 +3477,14 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // every line is kept under this width budget (in the estimator's units — tuned
     // against observed wrap points): map names that don't fit are shown through a
     // scrolling marquee window while the vote number and tally stay intact.
-    private const float HudMaxLineUnits = 26f;
+    // Widest a line may render before the panel word-wraps, in 1/1000 em. Derived
+    // from the wrap points observed in-game (~13.5 em) with a little headroom.
+    private const float HudMaxLineUnits = 13000f;
 
-    // Rendered width of one pad character in the estimator's units — the
+    // Rendered width of one pad character (a space advance) in 1/1000 em — the
     // granularity of the alignment padding, and the knob to tune if the column
     // drifts.
-    private const float NbspUnits = 0.5f;
+    private const float NbspUnits = 278f;
 
     // Alt+255 (U+00A0), the blank glyph used for padding. Written as an escape so
     // no file-encoding step can mangle it.
@@ -3495,15 +3497,38 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // cannot be trimmed.
     private const char PadChar = '\u00A0';
 
+    // Slack kept between a scrolled name and its budget (~one average glyph), so a
+    // marquee row never renders wider than the padded rows and drags the column.
+    private const float MarqueeMarginUnits = 560f;
+
     private static string HtmlEscape(string s)
         => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
-    // Rough proportional-font glyph width in "average glyph" units. Used to size
-    // the alignment padding and the marquee window, so close is good enough.
+    // Per-glyph advance widths in 1/1000 em (Arial/Helvetica metrics), which model
+    // the panel's proportional font far better than a few coarse size buckets did.
+    // The buckets mis-measured punctuation-heavy names badly enough to shift a row
+    // by a character, which is what kept the number column ragged.
+    // Index 0 == ' ' (U+0020) through '~' (U+007E).
+    private static readonly short[] GlyphWidths =
+    {
+        278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, //  !"#$%&'()*+,-./
+        556, 556, 556, 556, 556, 556, 556, 556, 556, 556,                               // 0-9
+        278, 278, 584, 584, 584, 556, 1015,                                             // :;<=>?@
+        667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833,                // A-M
+        722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611,                // N-Z
+        278, 278, 278, 469, 556, 333,                                                   // [\]^_`
+        556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833,                // a-m
+        556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500,                // n-z
+        334, 260, 334, 584                                                              // {|}~
+    };
+
     private static float CharWidth(char c)
-        => "iljtf!.,:;'|()[] 1".IndexOf(c) >= 0 ? 0.55f
-         : "mwMW@".IndexOf(c) >= 0 ? 1.5f
-         : char.IsUpper(c) || char.IsDigit(c) ? 1.15f : 1.0f;
+    {
+        if (c == PadChar) return NbspUnits;
+        if (c >= ' ' && c <= '~') return GlyphWidths[c - ' '];
+        if (c == '\u2022') return 350f;   // bullet, used by the marquee separator
+        return 556f;                      // unknown glyph: assume average
+    }
 
     private static float EstimateHudWidth(string s)
     {
@@ -3549,7 +3574,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             // The extra margin keeps a scrolled row visibly narrower than the shared
             // padded target — estimator error on a full-budget marquee row otherwise
             // pushes its real width past the others and skews the number column.
-            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally) - 2.0f;
+            float budget = HudMaxLineUnits - EstimateHudWidth(prefix) - EstimateHudWidth(tally) - MarqueeMarginUnits;
             string name = MarqueeName(OptionName(kvp.Value), budget);
 
             // Pad BETWEEN the name and the tally so every option row ends up the same
