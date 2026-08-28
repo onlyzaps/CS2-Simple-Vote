@@ -99,7 +99,7 @@ Run from the **server console**:
 
 Config lives at `addons/counterstrikesharp/configs/plugins/CS2SimpleVote/CS2SimpleVote.json`.
 
-The plugin **generates it for you**, grouped into the sections below with instructions above every setting (comments are safe — the loader skips them). A pristine copy of the defaults, `CS2SimpleVote.example.json`, is regenerated next to it on every load for reference. Hand edits apply on the next map change; your values are always preserved when the plugin refreshes the file layout.
+The plugin **generates it for you**: values grouped under short section headers, with no wall of comments to scroll past. The explanations live in **`CS2SimpleVote.README.md`**, a full configuration reference generated next to it (regenerated every load, so it always matches the build you are running), alongside `CS2SimpleVote.example.json` holding the pristine defaults. Hand edits apply on the next map change; your values are always preserved when the plugin refreshes the file layout.
 
 ### Steam Workshop Collection
 
@@ -238,6 +238,7 @@ Everything below is generated automatically on first launch, next to the config,
 | File | Purpose |
 |---|---|
 | `CS2SimpleVote.json` | Main config — sectioned with instructions above every setting |
+| `CS2SimpleVote.README.md` | Generated configuration reference — what every setting does (regenerated every load) |
 | `CS2SimpleVote.example.json` | Pristine defaults for reference (regenerated every load; edits are ignored) |
 | `collection_maps.json` | Steam collection maps — membership/titles auto-synced, you own the `enabled` flags |
 | `workshop_maps.json` | Manually added workshop maps — yours entirely (`!addmap` writes here) |

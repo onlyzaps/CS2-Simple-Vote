@@ -113,7 +113,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.8.3";
+    public override string ModuleVersion => "1.8.4";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -337,160 +337,262 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Console.WriteLine("[CS2SimpleVote] Config reloaded from disk.");
     }
 
-    // --- Sectioned config generation ---
-    // The plugin owns the layout of CS2SimpleVote.json: keys grouped into feature
-    // sections with instructions above each one. CounterStrikeSharp deserializes
-    // with comment-skipping enabled (its own generated configs start with a //
-    // header), so the comments are safe. The live file is (re)written whenever it
-    // is missing, predates the sectioned layout, lacks a newly added key, or the
-    // tracked game build changed — always from the CURRENT parsed Config, so hand
-    // edits are never lost. A pristine defaults copy is kept alongside it as
-    // CS2SimpleVote.example.json.
+    // --- Config generation ---
+    // One model drives three files, so they can never drift apart:
+    //   CS2SimpleVote.json         the live config — section headers and values only
+    //   CS2SimpleVote.README.md    what every setting does (regenerated each load)
+    //   CS2SimpleVote.example.json pristine defaults for reference
+    // The live config is rewritten only when it is missing, predates this layout,
+    // or lacks a newly added key — always from the CURRENT values, so hand edits
+    // survive. CounterStrikeSharp parses with comments enabled, so the section
+    // headers are safe.
 
-    private const string ConfigMarker = "CS2SimpleVote Configuration";
+    private const string ConfigMarker = "see CS2SimpleVote.README.md";
+    private const string ConfigReadmeName = "CS2SimpleVote.README.md";
+    private const string ConfigExampleName = "CS2SimpleVote.example.json";
 
-    private static string RenderSectionedConfig(VoteConfig c)
+    private sealed record ConfigEntry(string Key, string Value, string Doc);
+    private sealed record ConfigSection(string Title, string Intro, ConfigEntry[] Entries);
+
+    private static List<ConfigSection> BuildConfigModel(VoteConfig c)
     {
         static string J(object v) => JsonSerializer.Serialize(v);
-        var sb = new StringBuilder();
-        void Section(string title, params string[] lines)
+        static ConfigEntry E(string key, object value, string doc) => new(key, J(value), doc);
+
+        return new List<ConfigSection>
         {
-            sb.AppendLine();
-            sb.AppendLine("    // ----------------------------------------------------------------");
-            sb.AppendLine($"    // {title}");
-            sb.AppendLine("    // ----------------------------------------------------------------");
-            foreach (var l in lines) sb.AppendLine($"    // {l}");
-        }
-        void Key(string name, object value) => sb.AppendLine($"    \"{name}\": {J(value)},");
+            new("Steam Workshop Collection",
+                "The map pool is pulled from a Steam Workshop collection and re-synced on an interval.",
+                new[]
+                {
+                    E("steam_api_key", c.SteamApiKey,
+                        "Steam Web API key, required to resolve the collection and to look up maps for `!addmap`. Get one at <https://steamcommunity.com/dev/apikey>."),
+                    E("collection_id", c.CollectionId,
+                        "The Workshop collection whose maps make up the pool."),
+                    E("collection_refresh_minutes", c.CollectionRefreshMinutes,
+                        "Minutes between collection re-syncs. `0` fetches once at load; the minimum enforced interval is 1 minute."),
+                }),
 
-        sb.AppendLine("// ================================================================");
-        sb.AppendLine($"//  {ConfigMarker}");
-        sb.AppendLine("// ================================================================");
-        sb.AppendLine("//  - Edits apply automatically on the next map change (no reload).");
-        sb.AppendLine("//  - Comments are safe to keep; the loader ignores them.");
-        sb.AppendLine("//  - CS2SimpleVote.example.json holds the pristine defaults and is");
-        sb.AppendLine("//    regenerated every load (edits there are ignored).");
+            new("Admins",
+                "Who may use the admin commands (`!forcemap`, `!omitmap`, `!endvote`, `!changenow`, ...).",
+                new[]
+                {
+                    E("use_css_admins", c.UseCssAdmins,
+                        "Use CounterStrikeSharp's admin system: players with `@css/generic` or `@css/root` may use the admin commands. The manual list below keeps working either way."),
+                    E("admins", c.Admins,
+                        "SteamID64s granted admin access directly, e.g. `[76561198000000000, 76561198000000001]`."),
+                }),
+
+            new("Scheduled Vote Trigger",
+                "When the automatic map vote opens.",
+                new[]
+                {
+                    E("vote_rounds_before_end", c.VoteRoundsBeforeEnd,
+                        "How many rounds before the match can end the vote opens. The end round is derived from `mp_maxrounds`: with `mp_match_can_clinch` enabled a team can clinch at `mp_maxrounds / 2 + 1`, so the vote schedules against that; with clinching disabled every round is played, so the full `mp_maxrounds` applies. `0` disables the scheduled vote (RTV and admin votes still work). Requires `mp_maxrounds` greater than 0."),
+                }),
+
+            new("Vote Style",
+                "Chooses which of the two sections below applies. RTV votes are always timed (30 seconds) regardless of this setting.",
+                new[]
+                {
+                    E("enable_timed_vote", c.EnableTimedVote,
+                        "`true` runs each vote for a fixed number of seconds, never interrupted by round changes. `false` keeps the vote open across round ends."),
+                }),
+
+            new("Timed Vote",
+                "Used when `enable_timed_vote` is `true`.",
+                new[]
+                {
+                    E("timed_vote_seconds", c.TimedVoteSeconds,
+                        "How long a timed vote stays open, in seconds (clamped to 10-600)."),
+                }),
+
+            new("Round-Based Vote",
+                "Used when `enable_timed_vote` is `false`.",
+                new[]
+                {
+                    E("vote_open_for_rounds", c.VoteOpenForRounds,
+                        "How many rounds the vote stays open."),
+                    E("show_midvote_progress", c.ShowMidVoteProgress,
+                        "Print running tallies in chat at round ends. Round-based votes only - it does nothing during a timed vote."),
+                }),
+
+            new("Vote Options",
+                "What appears on the ballot.",
+                new[]
+                {
+                    E("enable_extend_vote", c.EnableExtendVote,
+                        "Adds `[0] Extend Current Map` to every vote (players type `0` or `!0`). If it wins, the next map is the current one, replayed after this match."),
+                    E("vote_options_count", c.VoteOptionsCount,
+                        "How many maps are offered per vote (clamped to 2-10)."),
+                }),
+
+            new("Vote HUD",
+                "A display-only panel in the centre of the screen: a yellow \"type a number to vote\" header, each numbered option with its live tally, and - for timed votes - a countdown footer that shifts green to yellow to red as time runs out. Players still vote by typing the number in chat.",
+                new[]
+                {
+                    E("enable_vote_hud", c.EnableVoteHud,
+                        "Show the panel. While enabled it replaces the plain `VOTE NOW!` prompt, the chat option list, and chat vote reminders. It is shown for the whole vote and hidden the moment the vote ends."),
+                    E("hud_font_file", c.HudFontFile,
+                        "Font used to compute the panel's column alignment. Leave empty to auto-detect the game's own font under `csgo/panorama/fonts` (encrypted `.uifont` packages are unwrapped automatically); set a filename or full path to override. The console logs which font was measured at load."),
+                }),
+
+            new("Vote Reminders",
+                "Chat nudges for players who have not voted yet.",
+                new[]
+                {
+                    E("vote_reminder_enabled", c.EnableReminders,
+                        "Periodically remind players who have not voted, re-printing the options in chat. Ignored while `enable_vote_hud` is on - the panel already keeps the options on screen."),
+                    E("vote_reminder_interval", c.ReminderIntervalSeconds,
+                        "Seconds between reminders."),
+                }),
+
+            new("Rock the Vote (RTV)",
+                "Player-initiated votes.",
+                new[]
+                {
+                    E("enable_rtv", c.EnableRtv,
+                        "Let players call a vote with `!rtv`."),
+                    E("rtv_ratio", c.RtvRatio,
+                        "Fraction of connected players required to trigger the vote, from just above 0 to 1. The threshold is re-checked when players disconnect, so a vote can never get stuck."),
+                    E("rtv_change_delay", c.RtvDelaySeconds,
+                        "Seconds between an RTV vote ending and the winning map loading."),
+                }),
+
+            new("Nominations",
+                "Letting players put maps on the ballot.",
+                new[]
+                {
+                    E("enable_nominate", c.EnableNominate,
+                        "Let players nominate maps into the next vote with `!nominate`."),
+                    E("nominate_per_page", c.NominatePerPage,
+                        "Maps listed per page in the nomination picker."),
+                }),
+
+            new("Recent Map Exclusion",
+                "Stops the same maps coming back around too quickly.",
+                new[]
+                {
+                    E("omit_recent_maps", c.OmitRecentMaps,
+                        "Keep recently played maps out of votes and nominations entirely."),
+                    E("recent_maps_count", c.RecentMapsCount,
+                        "How many recently played maps to exclude."),
+                }),
+
+            new("Current Map Message",
+                "Periodic chat message announcing what is being played.",
+                new[]
+                {
+                    E("enable_map_message", c.EnableMapMessage,
+                        "Announce the current map in chat on an interval."),
+                    E("show_server_name_in_map_message", c.ShowServerNameInMapMessage,
+                        "`true` reads \"You're playing <map> on <server_name>!\"; `false` reads just \"You're playing <map>!\"."),
+                    E("map_message_interval", c.CurrentMapMessageInterval,
+                        "Seconds between announcements."),
+                    E("server_name", c.ServerName,
+                        "Server name used in the announcement."),
+                }),
+
+            new("Map Change",
+                "Timing of the switch to the next map.",
+                new[]
+                {
+                    E("postmap_change_delay", c.PostMapChangeDelay,
+                        "Seconds after the match ends before the winning map loads (capped at 15)."),
+                }),
+
+            new("Managed by the plugin (do not edit)",
+                "Written by the plugin itself.",
+                new[]
+                {
+                    E("last_synced_build", c.LastSyncedBuild,
+                        "The game build (from `steam.inf`) the stock map list was last synced against. When this changes, `stock_maps.json` re-syncs from the engine: new maps appear disabled and removed maps are pruned."),
+                    E("ConfigVersion", c.Version,
+                        "Used by CounterStrikeSharp."),
+                }),
+        };
+    }
+
+    // The live config: grouped and labelled, but values only — the prose lives in
+    // the generated readme so this file stays scannable.
+    private static string RenderSectionedConfig(VoteConfig c)
+    {
+        var model = BuildConfigModel(c);
+        int total = model.Sum(s => s.Entries.Length), written = 0;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"// CS2SimpleVote configuration - {ConfigMarker} for what each setting does.");
+        sb.AppendLine("// Edits apply on the next map change. Comments are safe to keep.");
         sb.AppendLine("{");
-
-        Section("Steam Workshop Collection",
-            "The map pool is pulled from this Workshop collection and re-synced",
-            "every collection_refresh_minutes (0 = fetch once at load; minimum 1).",
-            "A Steam Web API key is required: https://steamcommunity.com/dev/apikey");
-        Key("steam_api_key", c.SteamApiKey);
-        Key("collection_id", c.CollectionId);
-        Key("collection_refresh_minutes", c.CollectionRefreshMinutes);
-
-        Section("Admins",
-            "use_css_admins: use CounterStrikeSharp's admin system for vote admin",
-            "access — players with @css/generic or @css/root may use the admin",
-            "commands. The manual \"admins\" SteamID64 list below keeps working",
-            "either way.",
-            "Example: \"admins\": [76561198000000000, 76561198000000001]");
-        Key("use_css_admins", c.UseCssAdmins);
-        Key("admins", c.Admins);
-
-        Section("Scheduled Vote Trigger",
-            "The automatic map vote opens vote_rounds_before_end rounds before the",
-            "match can end. The end round comes from mp_maxrounds: with",
-            "mp_match_can_clinch enabled the earliest possible end (maxrounds/2 + 1)",
-            "is used; with clinching disabled every round plays, so the full",
-            "mp_maxrounds is used instead. 0 disables the scheduled vote (RTV and",
-            "admin votes still work). Requires mp_maxrounds > 0.");
-        Key("vote_rounds_before_end", c.VoteRoundsBeforeEnd);
-
-        Section("Vote Style (switches between the two sections below)",
-            "true  = Timed Vote: the vote runs for a fixed number of seconds and",
-            "        is never interrupted by round changes.",
-            "false = Round-Based Vote: the vote stays open across round ends.",
-            "RTV votes are always timed (30 seconds) regardless of this setting.");
-        Key("enable_timed_vote", c.EnableTimedVote);
-
-        Section("Timed Vote",
-            "How long a timed vote stays open, in seconds (10-600).");
-        Key("timed_vote_seconds", c.TimedVoteSeconds);
-
-        Section("Round-Based Vote",
-            "vote_open_for_rounds: how many rounds the vote stays open.",
-            "show_midvote_progress: print running tallies in chat at round ends.",
-            "Round-based votes only - it does nothing for timed votes.");
-        Key("vote_open_for_rounds", c.VoteOpenForRounds);
-        Key("show_midvote_progress", c.ShowMidVoteProgress);
-
-        Section("Vote Options",
-            "enable_extend_vote: adds \"[0] Extend Current Map\" to every vote",
-            "(players type 0 or !0). If it wins, the next map is the current one.",
-            "vote_options_count: number of maps offered per vote (2-10).");
-        Key("enable_extend_vote", c.EnableExtendVote);
-        Key("vote_options_count", c.VoteOptionsCount);
-
-        Section("Vote HUD",
-            "Display-only center-screen vote panel: a yellow \"type a number in",
-            "chat to vote\" header, each numbered option with its live tally",
-            "(\"1: Map Name (3)\"), and for timed votes a countdown footer that",
-            "shifts green -> yellow -> red as time runs out. Rendered natively —",
-            "no extra plugins. Shown for the whole vote, hidden the moment it",
-            "ends. While enabled it replaces the plain \"VOTE NOW!\" prompt, the",
-            "chat option list, and chat vote reminders.",
-            "hud_font_file: the panel's column alignment is computed from real font",
-            "metrics read out of the game's own font file. Leave empty to auto-",
-            "detect it under csgo/panorama/fonts; set a filename (or full path) to",
-            "override. The console logs which font was measured at load.");
-        Key("enable_vote_hud", c.EnableVoteHud);
-        Key("hud_font_file", c.HudFontFile);
-
-        Section("Vote Reminders",
-            "Chat reminder (with the option list) for players who haven't voted,",
-            "every vote_reminder_interval seconds. Ignored while enable_vote_hud",
-            "is on - the HUD replaces it.");
-        Key("vote_reminder_enabled", c.EnableReminders);
-        Key("vote_reminder_interval", c.ReminderIntervalSeconds);
-
-        Section("Rock the Vote (RTV)",
-            "rtv_ratio: fraction of connected players required to trigger (0-1].",
-            "rtv_change_delay: seconds before the winning map loads.");
-        Key("enable_rtv", c.EnableRtv);
-        Key("rtv_ratio", c.RtvRatio);
-        Key("rtv_change_delay", c.RtvDelaySeconds);
-
-        Section("Nominations",
-            "Players nominate maps into the next vote with !nominate.");
-        Key("enable_nominate", c.EnableNominate);
-        Key("nominate_per_page", c.NominatePerPage);
-
-        Section("Recent Map Exclusion",
-            "Keeps the last recent_maps_count played maps out of votes and",
-            "nominations entirely.");
-        Key("omit_recent_maps", c.OmitRecentMaps);
-        Key("recent_maps_count", c.RecentMapsCount);
-
-        Section("Current Map Message",
-            "Periodic chat message announcing the current map. When",
-            "show_server_name_in_map_message is true it reads",
-            "\"You're playing <map> on <server_name>!\", otherwise just",
-            "\"You're playing <map>!\".");
-        Key("enable_map_message", c.EnableMapMessage);
-        Key("show_server_name_in_map_message", c.ShowServerNameInMapMessage);
-        Key("map_message_interval", c.CurrentMapMessageInterval);
-        Key("server_name", c.ServerName);
-
-        Section("Map Change",
-            "Seconds after the match ends before the winning map loads (max 15).");
-        Key("postmap_change_delay", c.PostMapChangeDelay);
-
-        Section("Managed by the plugin - do not edit",
-            "last_synced_build: the game build (steam.inf) the stock map list was",
-            "last synced against. ConfigVersion: used by CounterStrikeSharp.");
-        Key("last_synced_build", c.LastSyncedBuild);
-        sb.AppendLine($"    \"ConfigVersion\": {c.Version}");
-
+        foreach (var section in model)
+        {
+            if (written > 0) sb.AppendLine();
+            sb.AppendLine($"    // ---- {section.Title} ----");
+            foreach (var e in section.Entries)
+            {
+                written++;
+                sb.AppendLine($"    \"{e.Key}\": {e.Value}{(written < total ? "," : "")}");
+            }
+        }
         sb.Append('}');
         return sb.ToString();
     }
 
-    // Writes the live sectioned config (preserving current values) when needed, and
-    // always keeps CS2SimpleVote.example.json in sync with the plugin's defaults.
+    private static string RenderConfigReadme(string moduleVersion)
+    {
+        var model = BuildConfigModel(new VoteConfig());
+        var sb = new StringBuilder();
+        sb.AppendLine("# CS2SimpleVote - Configuration Reference");
+        sb.AppendLine();
+        sb.AppendLine($"Generated by CS2SimpleVote v{moduleVersion}. This file is rewritten every time the plugin loads,");
+        sb.AppendLine("so treat it as read-only - edit `CS2SimpleVote.json` instead.");
+        sb.AppendLine();
+        sb.AppendLine("Config edits apply automatically on the next map change; no reload or restart is needed.");
+        sb.AppendLine("Values shown below are the plugin defaults, not your current settings.");
+        sb.AppendLine();
+        sb.AppendLine("## Contents");
+        sb.AppendLine();
+        foreach (var section in model)
+        {
+            // GitHub-style anchor: keep letters, digits and existing hyphens,
+            // turn spaces into hyphens, drop the rest.
+            string anchor = new string(section.Title.ToLowerInvariant()
+                .Select(ch => char.IsLetterOrDigit(ch) || ch == '-' ? ch : ch == ' ' ? '-' : (char)0).ToArray())
+                .Replace(((char)0).ToString(), "");
+            sb.AppendLine($"- [{section.Title}](#{anchor})");
+        }
+        foreach (var section in model)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"## {section.Title}");
+            sb.AppendLine();
+            sb.AppendLine(section.Intro);
+            sb.AppendLine();
+            foreach (var e in section.Entries)
+            {
+                sb.AppendLine($"**`{e.Key}`** - default `{e.Value}`");
+                sb.AppendLine();
+                sb.AppendLine(e.Doc);
+                sb.AppendLine();
+            }
+        }
+        sb.AppendLine("## Other generated files");
+        sb.AppendLine();
+        sb.AppendLine($"- `{ConfigExampleName}` - the defaults above as a ready-to-copy config.");
+        sb.AppendLine("- `collection_maps.json` - maps from the Workshop collection. Membership and titles are synced for you; flip `enabled` to include or omit a map.");
+        sb.AppendLine("- `workshop_maps.json` - maps you add yourself (`!addmap` writes here). An entry needs only an `id`; the title fills in on the next refresh.");
+        sb.AppendLine("- `stock_maps.json` - the game's own maps, re-synced whenever the game build changes. All start disabled; flip `enabled` to add one to the pool.");
+        sb.AppendLine("- `recent_maps.json` - recently played map history.");
+        sb.AppendLine("- `logs/YYYY-MM-DD/events.log` - per-day log of votes, RTVs, admin actions and map changes.");
+        sb.AppendLine();
+        sb.AppendLine("All three map files are re-read before every vote, nomination and admin menu, so hand edits take effect immediately.");
+        return sb.ToString();
+    }
+
     private void GenerateConfigFiles(bool force)
     {
+        string dir = Path.GetDirectoryName(_configFilePath) ?? "";
+
         try
         {
             string text = File.Exists(_configFilePath) ? File.ReadAllText(_configFilePath) : "";
@@ -507,20 +609,26 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             if (force || missingKey || !text.Contains(ConfigMarker))
             {
                 File.WriteAllText(_configFilePath, rendered);
-                Console.WriteLine("[CS2SimpleVote] Wrote sectioned CS2SimpleVote.json (existing values preserved).");
+                Console.WriteLine("[CS2SimpleVote] Wrote CS2SimpleVote.json (existing values preserved).");
             }
         }
-        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not write sectioned config: {ex.Message}"); }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not write config: {ex.Message}"); }
 
+        WriteGeneratedFile(Path.Combine(dir, ConfigReadmeName), RenderConfigReadme(ModuleVersion), ConfigReadmeName);
+        WriteGeneratedFile(Path.Combine(dir, ConfigExampleName), RenderSectionedConfig(new VoteConfig()), ConfigExampleName);
+    }
+
+    // Regenerated documentation/reference files: rewritten only when the content
+    // actually changed, so an unchanged load never touches the disk.
+    private static void WriteGeneratedFile(string path, string content, string label)
+    {
         try
         {
-            string examplePath = Path.Combine(Path.GetDirectoryName(_configFilePath) ?? "", "CS2SimpleVote.example.json");
-            string example = RenderSectionedConfig(new VoteConfig());
-            string old = File.Exists(examplePath) ? File.ReadAllText(examplePath) : "";
-            if (!string.Equals(old, example, StringComparison.Ordinal))
-                File.WriteAllText(examplePath, example);
+            string old = File.Exists(path) ? File.ReadAllText(path) : "";
+            if (!string.Equals(old, content, StringComparison.Ordinal))
+                File.WriteAllText(path, content);
         }
-        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not write example config: {ex.Message}"); }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Could not write {label}: {ex.Message}"); }
     }
 
     public override void Load(bool hotReload)
