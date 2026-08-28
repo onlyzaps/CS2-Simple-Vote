@@ -4,6 +4,7 @@ using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -112,7 +113,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.8.2";
+    public override string ModuleVersion => "1.8.3";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -3595,14 +3596,169 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         return 0;
     }
 
+    // Set by the container unwrapper when a package holds several faces, so the
+    // load log can say exactly which face was measured.
+    private static string? _lastFontFaceName;
+
+    // Peels whatever wrapper the file has down to raw sfnt (TrueType/OpenType)
+    // bytes: plain .ttf/.otf pass through, Valve's old VFONT1 (.vfont) is
+    // XOR-decoded, and CS2's .uifont — a protobuf package of AES-encrypted
+    // OpenType files (format documented by ValveResourceFormat/SteamTracking) —
+    // is unwrapped and the regular-weight face picked out.
+    private static byte[]? UnwrapFontContainer(byte[] raw)
+    {
+        _lastFontFaceName = null;
+        if (raw.Length < 16) return null;
+
+        uint tag = BE32(raw, 0);
+        if (tag == 0x00010000 || tag == 0x4F54544F /* OTTO */ || tag == 0x74727565 /* true */)
+            return raw;
+
+        if (Encoding.ASCII.GetString(raw, raw.Length - 6, 6) == "VFONT1")
+            return DecodeVFont(raw);
+
+        var faces = TryReadUiFontPackage(raw);
+        if (faces == null || faces.Count == 0) return null;
+        var pick = faces.FirstOrDefault(f => f.Name.Contains("regular", StringComparison.OrdinalIgnoreCase))
+                ?? faces.FirstOrDefault(f => !f.Name.Contains("bold", StringComparison.OrdinalIgnoreCase)
+                                          && !f.Name.Contains("italic", StringComparison.OrdinalIgnoreCase)
+                                          && !f.Name.Contains("black", StringComparison.OrdinalIgnoreCase))
+                ?? faces[0];
+        _lastFontFaceName = pick.Name;
+        return pick.Data;
+    }
+
+    // Valve VFONT1 (.vfont): "VFONT1" trailer, a seed-byte count before it, and a
+    // rolling XOR over the body (algorithm per ValveResourceFormat's ValveFont, MIT).
+    private static byte[]? DecodeVFont(byte[] f)
+    {
+        const int Trick = 167;
+        if (f.Length < 8) return null;
+        int count = f[f.Length - 7];
+        int outLen = f.Length - 6 - count;
+        if (count < 1 || outLen <= 0) return null;
+
+        int magic = Trick;
+        int seedStart = f.Length - 6 - count;
+        for (int i = 0; i < count - 1; i++)
+            magic ^= (f[seedStart + i] + Trick) % 256;
+
+        var output = new byte[outLen];
+        for (int i = 0; i < outLen; i++)
+        {
+            byte cur = f[i];
+            output[i] = (byte)(cur ^ magic);
+            magic = (cur + Trick) % 256;
+        }
+        return output;
+    }
+
+    private sealed class UiFontFace
+    {
+        public string Name = "";
+        public byte[] Data = Array.Empty<byte>();
+    }
+
+    // The (public, well-documented) key CS2 encrypts its packaged UI fonts with.
+    private static readonly byte[] UiFontKey =
+    {
+        0x13, 0xE6, 0x21, 0x14, 0xC7, 0xFA, 0x3C, 0xB9,
+        0x3E, 0x86, 0xF4, 0x76, 0xF6, 0xB3, 0x2C, 0x20,
+        0x4D, 0x82, 0xA4, 0x19, 0xAF, 0xF3, 0x13, 0xAE,
+        0xBB, 0xA1, 0xAF, 0x92, 0xE7, 0xA0, 0xAC, 0x8D,
+    };
+
+    private static ulong ReadVarint(byte[] d, ref int pos)
+    {
+        ulong result = 0;
+        int shift = 0;
+        while (shift < 64 && pos < d.Length)
+        {
+            byte b = d[pos++];
+            result |= (ulong)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return result;
+            shift += 7;
+        }
+        throw new InvalidDataException("malformed varint");
+    }
+
+    // CUIFontFilePackagePB: 1 = package_version, 2 = encrypted_font_files
+    //   -> each: 1 = encrypted_contents (AES-256, ECB-wrapped IV + CBC body)
+    //   -> decrypted CUIFontFilePB: 1 = font_file_name, 2 = opentype_font_data
+    private static List<UiFontFace>? TryReadUiFontPackage(byte[] d)
+    {
+        try
+        {
+            var faces = new List<UiFontFace>();
+            int pos = 0;
+            while (pos < d.Length)
+            {
+                ulong outerTag = ReadVarint(d, ref pos);
+                ulong field = outerTag >> 3, wire = outerTag & 0x7;
+                if (field == 1 && wire == 0)
+                {
+                    if (ReadVarint(d, ref pos) != 1) return null; // unknown package version
+                }
+                else if (field == 2 && wire == 2)
+                {
+                    int len = (int)ReadVarint(d, ref pos);
+                    if (len < 0 || pos + len > d.Length) return null;
+
+                    // encrypted_font_files -> encrypted_contents
+                    int inner = pos, innerEnd = pos + len;
+                    pos = innerEnd;
+                    byte[]? encrypted = null;
+                    while (inner < innerEnd)
+                    {
+                        ulong t = ReadVarint(d, ref inner);
+                        if ((t >> 3) == 1 && (t & 0x7) == 2)
+                        {
+                            int elen = (int)ReadVarint(d, ref inner);
+                            if (elen < 17 || inner + elen > innerEnd) return null;
+                            encrypted = new byte[elen];
+                            Array.Copy(d, inner, encrypted, 0, elen);
+                            inner += elen;
+                        }
+                        else return null;
+                    }
+                    if (encrypted == null) continue;
+
+                    using var aes = Aes.Create();
+                    aes.KeySize = 256;
+                    aes.Key = UiFontKey;
+                    byte[] iv = aes.DecryptEcb(encrypted.AsSpan(0, 16).ToArray(), PaddingMode.None);
+                    byte[] plain = aes.DecryptCbc(encrypted.AsSpan(16).ToArray(), iv, PaddingMode.PKCS7);
+
+                    // CUIFontFilePB
+                    string name = "";
+                    byte[]? data = null;
+                    int fp = 0;
+                    while (fp < plain.Length)
+                    {
+                        ulong t = ReadVarint(plain, ref fp);
+                        int flen = (int)ReadVarint(plain, ref fp);
+                        if (flen < 0 || fp + flen > plain.Length) return null;
+                        if ((t >> 3) == 1) name = Encoding.UTF8.GetString(plain, fp, flen);
+                        else if ((t >> 3) == 2) { data = new byte[flen]; Array.Copy(plain, fp, data, 0, flen); }
+                        fp += flen;
+                    }
+                    if (data != null) faces.Add(new UiFontFace { Name = name, Data = data });
+                }
+                else return null;
+            }
+            return faces;
+        }
+        catch { return null; }
+    }
+
     // Returns advance widths in 1/1000 em for ' '..'~' (index 0..94), or null.
     private static float[]? ReadFontWidths(string path, out float bulletWidth)
     {
         bulletWidth = 350f;
         try
         {
-            byte[] f = File.ReadAllBytes(path);
-            if (f.Length < 12) return null;
+            byte[]? f = UnwrapFontContainer(File.ReadAllBytes(path));
+            if (f == null || f.Length < 12) return null;
 
             var tables = new Dictionary<string, int>(StringComparer.Ordinal);
             int numTables = BE16(f, 4);
@@ -3680,9 +3836,16 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                          || f.EndsWith(".otf", StringComparison.OrdinalIgnoreCase)
                          || f.EndsWith(".uifont", StringComparison.OrdinalIgnoreCase))
                 .ToList();
-            // The panel renders in the HUD's own face; prefer it, then the general UI font.
-            string[] preferred = { "stratum2-bold", "stratum2bold", "stratum2-regular", "stratum2",
-                                   "notosans-bold", "notosans-regular", "notosans" };
+            // The panel body renders in the HUD face's regular weight — prefer that,
+            // exact filename matches before loose ones.
+            string[] preferred = { "stratum2-regular", "stratum2", "stratum2-bold",
+                                   "notosans-regular", "notosans-bold", "notosans" };
+            foreach (var want in preferred)
+            {
+                var hit = files.FirstOrDefault(f =>
+                    Path.GetFileNameWithoutExtension(f).Replace("_", "-").Equals(want, StringComparison.OrdinalIgnoreCase));
+                if (hit != null) return hit;
+            }
             foreach (var want in preferred)
             {
                 var hit = files.FirstOrDefault(f =>
@@ -3703,8 +3866,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return;
         }
         _fontWidths = ReadFontWidths(path, out _fontBulletWidth);
+        string face = _lastFontFaceName != null ? $" [{_lastFontFaceName}]" : "";
         Console.WriteLine(_fontWidths != null
-            ? $"[CS2SimpleVote] Vote panel metrics read from {Path.GetFileName(path)} (space={_fontWidths[0]:0}, M={_fontWidths['M' - ' ']:0} per 1000em)."
+            ? $"[CS2SimpleVote] Vote panel metrics read from {Path.GetFileName(path)}{face} (space={_fontWidths[0]:0}, M={_fontWidths['M' - ' ']:0} per 1000em)."
             : $"[CS2SimpleVote] Could not parse {Path.GetFileName(path)} — using built-in metrics.");
     }
 
