@@ -2555,23 +2555,23 @@
     ]
   },
   "packageFolders": {
-    "C:\\Users\\cturner\\.nuget\\packages\\": {},
+    "C:\\Users\\vindict6\\.nuget\\packages\\": {},
     "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\cturner\\Desktop\\simplevotecollectionnest\\CS2SimpleVote.csproj",
+      "projectUniqueName": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
       "projectName": "CS2SimpleVote",
-      "projectPath": "C:\\Users\\cturner\\Desktop\\simplevotecollectionnest\\CS2SimpleVote.csproj",
-      "packagesPath": "C:\\Users\\cturner\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\cturner\\Desktop\\simplevotecollectionnest\\obj\\",
+      "projectPath": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
+      "packagesPath": "C:\\Users\\vindict6\\.nuget\\packages\\",
+      "outputPath": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
       ],
       "configFilePaths": [
-        "C:\\Users\\cturner\\AppData\\Roaming\\NuGet\\NuGet.Config",
+        "C:\\Users\\vindict6\\AppData\\Roaming\\NuGet\\NuGet.Config",
         "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
         "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
       ],
@@ -2580,7 +2580,7 @@
       ],
       "sources": {
         "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
-        "C:\\Program Files\\dotnet\\library-packs": {},
+        "c:\\program files\\dotnet\\library-packs": {},
         "https://api.nuget.org/v3/index.json": {}
       },
       "frameworks": {
@@ -2626,7 +2626,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.312/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "c:\\program files\\dotnet\\sdk\\9.0.317/PortableRuntimeIdentifierGraph.json"
       }
     }
   }
