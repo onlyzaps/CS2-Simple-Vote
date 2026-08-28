@@ -111,7 +111,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.2";
+    public override string ModuleVersion => "1.7.3";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -417,11 +417,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Key("vote_options_count", c.VoteOptionsCount);
 
         Section("Vote HUD",
-            "Display-only center-screen vote panel: each numbered option with its",
-            "live tally (\"1: Map Name (3)\"), rendered natively — no extra",
-            "plugins. Players vote in chat as usual. Shown for the whole vote,",
-            "hidden the moment it ends. Fully replaces the plain \"VOTE NOW!\"",
-            "prompt and suppresses chat vote reminders while enabled.");
+            "Display-only center-screen vote panel: a yellow \"type a number in",
+            "chat to vote\" header, each numbered option with its live tally",
+            "(\"1: Map Name (3)\"), and for timed votes a countdown footer that",
+            "shifts green -> yellow -> red as time runs out. Rendered natively —",
+            "no extra plugins. Shown for the whole vote, hidden the moment it",
+            "ends. While enabled it replaces the plain \"VOTE NOW!\" prompt, the",
+            "chat option list, and chat vote reminders.");
         Key("enable_vote_hud", c.EnableVoteHud);
 
         Section("Vote Reminders",
@@ -603,6 +605,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
+        RegisterListener<Listeners.OnTick>(OnVoteHudTick);
 
         // HookMode.Pre so returning HookResult.Handled suppresses the chat message —
         // plugin commands and vote/menu input are processed but never broadcast.
@@ -806,6 +809,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
+        RemoveListener<Listeners.OnTick>(OnVoteHudTick);
+        _voteCenterHtmlCache = "";
 
         if (_playerChatDelegate != null)
         {
@@ -870,6 +875,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _previousWinningMapName = null;
         _voteIsTimed = false;
         _voteEndsAtUtc = DateTime.MinValue;
+        _voteTotalSeconds = 0f;
+        _voteCenterHtmlCache = "";
 
         _rtvVoters.Clear();
         _playerVotes.Clear();
@@ -2008,6 +2015,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         if (!_voteInProgress) { player!.PrintToChat($" {ColorDefault}There is no vote currently in progress."); return; }
+        if (Config.EnableVoteHud)
+        {
+            // The panel is already on screen — no need to spam the list into chat.
+            player!.PrintToChat($" {ColorDefault}The options are on your screen — type the {ColorGreen}number{ColorDefault} in chat to recast your vote.");
+            return;
+        }
         player!.PrintToChat($" {ColorDefault}Redisplaying vote options. You may recast your vote.");
         PrintVoteOptionsToPlayer(player);
     }
@@ -3150,6 +3163,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (_voteIsTimed)
         {
             float voteSeconds = (isRtv || isRevote) ? 30.0f : Config.TimedVoteSeconds;
+            _voteTotalSeconds = voteSeconds;
             _voteEndsAtUtc = DateTime.UtcNow.AddSeconds(voteSeconds);
             Server.PrintToChatAll($" {ColorDefault}Vote ending in {ColorGreen}{voteSeconds:0}{ColorDefault} seconds!");
             _voteEndTimer = AddTimer(voteSeconds, () => EndVote(), TimerFlags.STOP_ON_MAPCHANGE);
@@ -3161,7 +3175,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                : $" {ColorDefault}Vote will remain open until the round ends.");
         }
 
-        PrintVoteOptionsToAll();
+        // The center panel replaces the chat option list entirely while enabled;
+        // players still vote by typing the number in chat.
+        if (Config.EnableVoteHud)
+            _voteCenterHtmlCache = BuildVoteCenterHtml();
+        else
+            PrintVoteOptionsToAll();
 
         // Chat reminders are redundant while the center-screen HUD is enabled —
         // the panel already keeps the options in front of everyone.
@@ -3174,20 +3193,16 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
         }
 
-        // Center-screen render tick. 0.5s keeps both the HUD panel and the plain
-        // center prompt persistent (the engine fades center messages that aren't
-        // re-sent). All timing derives from absolute deadlines, so the fast tick
-        // never skews the countdown.
+        // 0.5s refresh tick: rebuilds the cached vote panel (countdown + tallies)
+        // in HUD mode — the per-tick listener does the actual sending — or re-sends
+        // the plain VOTE NOW prompt otherwise.
         _centerMessageTimer = AddTimer(0.5f, () => {
             if (_unloaded) return;
             try
             {
                 if (Config.EnableVoteHud)
                 {
-                    // The center vote panel fully replaces the VOTE NOW prompt.
-                    string html = BuildVoteCenterHtml();
-                    foreach (var p in GetHumanPlayers())
-                        p.PrintToCenterHtml(html);
+                    _voteCenterHtmlCache = BuildVoteCenterHtml();
                 }
                 else
                 {
@@ -3204,7 +3219,18 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult HandleVoteInput(CCSPlayerController player, string input)
     {
-        if (int.TryParse(input, out int option) && _activeVoteOptions.ContainsKey(option)) { _playerVotes[player.Slot] = option; string votedMapId = _activeVoteOptions[option]; string votedMapName = OptionName(votedMapId); Log("VOTE", $"{PlayerTag(player)} voted for option {option}: {votedMapName} ({votedMapId})"); player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{votedMapName}{ColorDefault}"); return HookResult.Handled; }
+        if (int.TryParse(input, out int option) && _activeVoteOptions.ContainsKey(option))
+        {
+            _playerVotes[player.Slot] = option;
+            string votedMapId = _activeVoteOptions[option];
+            string votedMapName = OptionName(votedMapId);
+            Log("VOTE", $"{PlayerTag(player)} voted for option {option}: {votedMapName} ({votedMapId})");
+            player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{votedMapName}{ColorDefault}");
+            // Tallies changed — refresh the panel right away instead of waiting
+            // for the next 0.5s rebuild.
+            if (Config.EnableVoteHud) _voteCenterHtmlCache = BuildVoteCenterHtml();
+            return HookResult.Handled;
+        }
         return HookResult.Continue;
     }
 
@@ -3278,7 +3304,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Server.PrintToChatAll($" {ColorDefault}Winner: {ColorGreen}{winnerLabel}{ColorDefault}" + (voteCount > 0 ? $" with {ColorGreen}{voteCount}{ColorDefault} votes!" : " (Random/Previous)"));
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
 
-        // The panel hides the moment the vote is over.
+        // The panel hides the moment the vote is over: stop the per-tick re-send
+        // first, then blank the hint so it doesn't linger through its fade.
+        _voteCenterHtmlCache = "";
         if (Config.EnableVoteHud)
             foreach (var p in GetHumanPlayers())
                 try { p.PrintToCenterHtml(" "); } catch { }
@@ -3343,10 +3371,19 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // --- Center vote panel (enable_vote_hud) ---
     // A display-only center-screen panel in the style of CS2MenuManager's
     // CenterHtmlMenu, implemented in-house with the native PrintToCenterHtml —
-    // no dependency, no entities, no input of its own. Just the numbered options
-    // with live tallies; players vote in chat as usual. The 0.5s vote render tick
-    // re-sends it (the engine fades center messages otherwise) and it is cleared
-    // the moment the vote ends.
+    // no dependency, no entities, no input of its own. A yellow header telling
+    // players to vote in chat, the numbered options with live tallies, and (for
+    // timed votes) a countdown footer that goes green -> yellow -> red as time
+    // runs out. While the panel is on, the chat option list is suppressed.
+    //
+    // Rendering: the html is CACHED and rebuilt only when something changes (the
+    // 0.5s vote timer for the countdown/tallies, plus immediately on each cast
+    // vote), while a per-tick listener re-sends the cached string — center-html
+    // hints start fading right away unless constantly re-sent, so anything slower
+    // visibly pulses. Cleared the moment the vote ends.
+
+    private string _voteCenterHtmlCache = "";
+    private float _voteTotalSeconds;
 
     private static string HtmlEscape(string s)
         => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
@@ -3354,12 +3391,33 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private string BuildVoteCenterHtml()
     {
         var sb = new StringBuilder();
+        sb.Append("<font color='#FFD700'><b>Type a number in chat to vote</b></font>");
         foreach (var kvp in OrderedVoteOptions())
         {
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
-            sb.Append($"<font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(OptionName(kvp.Value))}</font> <font color='#B0B0B0'>({votes})</font><br>");
+            sb.Append($"<br><font color='#FF5722'>{kvp.Key}:</font> <font color='#EAD1AF'>{HtmlEscape(OptionName(kvp.Value))}</font> <font color='#B0B0B0'>({votes})</font>");
+        }
+        if (_voteIsTimed)
+        {
+            int remaining = VoteSecondsRemaining();
+            float frac = _voteTotalSeconds > 0 ? remaining / _voteTotalSeconds : 1f;
+            string color = frac > 0.5f ? "#4CAF50" : frac > 0.25f ? "#FFD700" : "#FF4444";
+            sb.Append($"<br><font color='{color}'>{remaining}s remaining</font>");
         }
         return sb.ToString();
+    }
+
+    // Center-html hints fade unless re-sent constantly — sending the cached panel
+    // every tick keeps it rock solid (the same approach CSS's CenterHtmlMenu uses).
+    private void OnVoteHudTick()
+    {
+        if (_unloaded || _voteCenterHtmlCache.Length == 0) return;
+        try
+        {
+            foreach (var p in GetHumanPlayers())
+                p.PrintToCenterHtml(_voteCenterHtmlCache);
+        }
+        catch { /* never let a render error hit the tick */ }
     }
 
     private string GetMapName(string mapId)

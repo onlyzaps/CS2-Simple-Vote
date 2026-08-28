@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.7.2-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.7.3-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -20,7 +20,7 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 - **Match-aware scheduled votes** — the automatic vote opens `vote_rounds_before_end` rounds before the match can end, computed from `mp_maxrounds` and `mp_match_can_clinch`. No hardcoded round numbers to keep in sync with your server config.
 - **Extend option** — optionally adds `[0] Extend Current Map` to every vote (`0` or `!0` to cast); if it wins, the next map is the current one.
 - **Round-based or timed votes** — scheduled votes stay open for N rounds, or flip one flag to run them on a seconds timer instead (timed votes are never interrupted by round changes).
-- **Center vote panel** — optional display-only panel in the center of the screen listing each numbered option with its live tally (`1: Map Name (3)`), styled like CS2MenuManager's CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — no dependency, no entities, no keys to learn. Players vote in chat as usual; the panel stays up for the whole vote and disappears the moment it ends.
+- **Center vote panel** — optional display-only panel in the center of the screen: a yellow "type a number in chat to vote" header, each numbered option with its live tally (`1: Map Name (3)`), and a countdown footer that shifts green → yellow → red as time runs out. Styled like CS2MenuManager's CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — no dependency, no entities, no keys to learn. Players vote in chat as usual (the chat option list is suppressed while the panel is on); it stays up for the whole vote and disappears the moment it ends.
 - **CounterStrikeSharp admin support** — vote admin access via `@css/generic` / `@css/root`; the manual SteamID list still works.
 - **Recent-map exclusion** — the last `recent_maps_count` played maps are kept out of votes entirely: the random pool *and* nominations. Works for workshop and stock maps alike.
 - **Self-documenting config** — `CS2SimpleVote.json` is generated sectioned by feature with instructions above every setting, plus a pristine `CS2SimpleVote.example.json` for reference. Edits apply on the next map change, no restart.
@@ -163,15 +163,17 @@ RTV votes are always timed (30 seconds) regardless of this setting.
 |---|---|---|
 | `enable_vote_hud` | `false` | Center vote panel; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
 
-A display-only panel in the center of the screen, styled like [CS2MenuManager](https://github.com/schwarper/CS2MenuManager)'s CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — **no dependency, no entities, no keys to learn**. Just the numbered options with their live tallies:
+A display-only panel in the center of the screen, styled like [CS2MenuManager](https://github.com/schwarper/CS2MenuManager)'s CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — **no dependency, no entities, no keys to learn**:
 
 ```
+Type a number in chat to vote      ← yellow header
 1: Dust II (3)
 2: Mirage (1)
-0: Extend Current Map (0)    ← when enable_extend_vote is on
+0: Extend Current Map (0)          ← when enable_extend_vote is on
+42s remaining                      ← timed votes: green → yellow → red
 ```
 
-Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in, stays up for the whole vote, and disappears the moment the vote ends. No header, no footer, no input of its own.
+Players vote by **typing the option number in chat** as usual — the panel updates live as votes come in (re-sent every tick so it never flickers), stays up for the whole vote, and disappears the moment the vote ends. The countdown footer turns **green** above 50% time left, **yellow** down to 25%, then **red**. While the panel is enabled, the option list is no longer printed into chat (chat still announces the vote and the winner).
 
 ### Vote Reminders
 
