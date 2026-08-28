@@ -113,7 +113,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.8.4";
+    public override string ModuleVersion => "1.8.5";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -123,6 +123,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     // Data Sources
     private List<MapItem> _availableMaps = new();
+    private List<MapItem> _allKnownMaps = new();
     private List<MapItem> _recentMaps = new();
     private HttpClient _httpClient = new();
     private CounterStrikeSharp.API.Modules.Timers.Timer? _reminderTimer;
@@ -190,6 +191,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private List<StockMapEntry> _stockMaps = new();
     private Dictionary<string, string> _engineMapTitles = new(StringComparer.OrdinalIgnoreCase);
     private bool _stockSyncWarned = false;
+    private bool _engineTitlesLoaded = false;
+    private bool _noRoundLimitWarned = false;
     private DateTime _lastPoolsRefresh = DateTime.MinValue;
 
     // Omit word-patterns from the pre-1.5 layout, kept in memory for this session so
@@ -272,6 +275,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (Config.VoteRoundsBeforeEnd < 0) Config.VoteRoundsBeforeEnd = 0;
         if (Config.LastSyncedBuild < 0) Config.LastSyncedBuild = 0;
         Config.TimedVoteSeconds = Math.Clamp(Config.TimedVoteSeconds, 10.0f, 600.0f);
+        // Both feed REPEAT timers — a zero/near-zero value would flood chat.
+        if (Config.ReminderIntervalSeconds < 5.0f) Config.ReminderIntervalSeconds = 5.0f;
+        if (Config.CurrentMapMessageInterval > 0f && Config.CurrentMapMessageInterval < 10.0f)
+            Config.CurrentMapMessageInterval = 10.0f;
         // Enforce a sane floor so a mistyped tiny value can't hammer the Steam API.
         if (Config.CollectionRefreshMinutes > 0 && Config.CollectionRefreshMinutes < 1.0f)
             Config.CollectionRefreshMinutes = 1.0f;
@@ -922,6 +929,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _playerForcemapPage.Clear();
         _setnextmapPlayers.Clear();
         _playerSetNextMapPage.Clear();
+        _helpMenuPlayers.Clear();
 
         // 6. Remove listeners and handlers
         DeregisterEventHandler<EventRoundStart>(OnRoundStart);
@@ -998,6 +1006,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _voteEndsAtUtc = DateTime.MinValue;
         _voteTotalSeconds = 0f;
         _voteCenterHtmlCache = "";
+        _hudScrollTick = 0;
 
         _rtvVoters.Clear();
         _playerVotes.Clear();
@@ -1163,11 +1172,17 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     // Single atomic reference swap — code already holding the previous list keeps a
     // valid snapshot; new reads see the new pool.
-    private void RebuildAvailableMaps() => _availableMaps = BuildPool(enabledOnly: true);
+    private void RebuildAvailableMaps()
+    {
+        _availableMaps = BuildPool(enabledOnly: true);
+        _allKnownMaps = BuildPool(enabledOnly: false);
+    }
 
     // Every map the plugin knows about, including disabled ones. Admin commands
     // (!forcemap / !setnextmap) and name lookups deliberately see everything.
-    private List<MapItem> AllKnownMaps() => BuildPool(enabledOnly: false);
+    // Kept in step with _availableMaps by RebuildAvailableMaps — every path that
+    // mutates a map list already calls it, so this is never stale.
+    private List<MapItem> AllKnownMaps() => _allKnownMaps;
 
     // Re-reads every hand-editable map file and rebuilds the live pool. Runs before
     // every vote and menu so realtime edits are always honored. The throttle bounds
@@ -1217,7 +1232,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // engine on the spot.
         if (!File.Exists(_stockMapsFilePath))
         {
-            if (_engineMapTitles.Count == 0) LoadEngineMapTitles();
+            if (!_engineTitlesLoaded) LoadEngineMapTitles();
             SyncStockMapsConfig();
         }
         else
@@ -1455,6 +1470,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // (not per map start) because the file is several MB.
     private void LoadEngineMapTitles()
     {
+        _engineTitlesLoaded = true;
         _engineMapTitles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         try
         {
@@ -1631,9 +1647,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
 
     // Tracked (workshop-ID) entries match on title, or on an exact ID so
-    // "!omitmap 3070321328" targets one specific map.
+    // "!omitmap 3070321328" targets one specific map. An entry whose title is
+    // still blank (awaiting Steam backfill) is only ever matched by exact ID —
+    // otherwise a name fragment like "307" would substring-match the ID.
     private static bool TrackedMatchesPattern(TrackedMapEntry e, string pattern)
-        => MapMatchesPattern(TitleOf(e), pattern) || pattern.Equals(e.Id, StringComparison.OrdinalIgnoreCase);
+        => (!string.IsNullOrWhiteSpace(e.Title) && MapMatchesPattern(e.Title, pattern))
+           || pattern.Equals(e.Id, StringComparison.OrdinalIgnoreCase);
 
     // Stock entries match on title or engine map name ("!omitmap de_dust2").
     private static bool StockMatchesPattern(StockMapEntry e, string pattern)
@@ -1849,7 +1868,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 {
                     if (batch.Contains(Config.CollectionId))
                         throw new Exception("Steam API returned no publishedfiledetails for the root collection. Check Collection ID.");
-                    continue;
+                    // Abort rather than continue: a silently dropped batch would make
+                    // the sync think those maps left the collection, deleting their
+                    // entries (and any \"enabled\": false flags) from collection_maps.json.
+                    throw new Exception($"Steam API returned no publishedfiledetails for a batch of {batch.Count} items — refresh aborted, keeping the current collection list.");
                 }
 
                 foreach (var item in detailsArr.EnumerateArray())
@@ -2059,7 +2081,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         // Menu input (numbers / "cancel") is consumed by the open menu and hidden;
         // anything else falls through and shows in chat normally.
-        if (_helpMenuPlayers.Contains(p.Slot)) return HandleHelpInput(p, cleanMsg);
+        if (_helpMenuPlayers.Contains(p.Slot))
+        {
+            var helpResult = HandleHelpInput(p, cleanMsg);
+            if (helpResult == HookResult.Handled) return helpResult;
+            // Anything other than 1/2/cancel closed the menu; the message now runs
+            // through normal handling below (commands, vote numbers, plain chat).
+        }
         if (_nominatingPlayers.ContainsKey(p.Slot)) return HandleNominationInput(p, cleanMsg);
         if (_forcemapPlayers.ContainsKey(p.Slot)) return HandleForcemapInput(p, cleanMsg);
         if (_setnextmapPlayers.ContainsKey(p.Slot)) return HandleSetNextMapInput(p, cleanMsg);
@@ -2071,7 +2099,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (cmd.Equals("help", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => PrintHelp(p)); return HookResult.Handled; }
         if (cmd.Equals("forcevote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceVote(p)); return HookResult.Handled; }
         if (cmd.Equals("forcertv", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptForceRtv(p)); return HookResult.Handled; }
-        if (cmd.Equals("endvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndVote(p)); return HookResult.Handled; }
+        if (cmd.Equals("endvote", StringComparison.OrdinalIgnoreCase) || cmd.Equals("finishvote", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndVote(p)); return HookResult.Handled; }
         if (cmd.Equals("changenow", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptChangeNow(p)); return HookResult.Handled; }
         if (cmd.Equals("endwarmup", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptEndWarmup(p)); return HookResult.Handled; }
         if (cmd.Equals("votedebug", StringComparison.OrdinalIgnoreCase)) { Server.NextFrame(() => AttemptVoteDebug(p)); return HookResult.Handled; }
@@ -2283,6 +2311,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             else PrintAdminHelp(player);
             return HookResult.Handled;
         }
+        // Any other input abandons the picker rather than trapping the player.
+        _helpMenuPlayers.Remove(player.Slot);
         return HookResult.Continue;
     }
 
@@ -3317,7 +3347,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _nextMapName = null;
         _pendingMapId = null;
         _currentVoteRoundDuration = 0;
-        _playerVotes.Clear(); _activeVoteOptions.Clear(); _nominatingPlayers.Clear(); _playerNominationPage.Clear();
+        _hudScrollTick = 0; // every vote's marquee starts at the names' beginnings
+        _playerVotes.Clear(); _activeVoteOptions.Clear(); _nominatingPlayers.Clear(); _playerNominationPage.Clear(); _helpMenuPlayers.Clear();
 
         // Nominations are re-checked against the freshly rebuilt pool AND the
         // recent-map list here, in case a map was disabled (file edit or !omitmap)
@@ -3348,9 +3379,21 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         for (int i = 0; i < mapsToVote.Count; i++) _activeVoteOptions[i + 1] = mapsToVote[i].Id;
 
+        // Nothing to vote on (empty/fully-disabled pool, or everything filtered as
+        // current/recent): abort before any announcement or timer exists, leaving
+        // state exactly as it was so a later vote can still run.
+        if (mapsToVote.Count == 0)
+        {
+            _voteInProgress = false;
+            _isForceVote = false; _isRtvVote = false; _isScheduledVote = false;
+            Log("VOTE", "Vote aborted: no eligible maps (pool empty or everything filtered out).");
+            Server.PrintToChatAll($" {ColorRed}Map vote skipped — no eligible maps. {ColorDefault}Check the map list files.");
+            return;
+        }
+
         // The extend option occupies key 0 so "0" / "!0" casts it. Only offered when
         // there is at least one real map option (an extend-only vote is pointless).
-        if (Config.EnableExtendVote && mapsToVote.Count > 0)
+        if (Config.EnableExtendVote)
             _activeVoteOptions[0] = ExtendOptionId;
 
         Server.PrintToChatAll($" {ColorDefault}--- {ColorGreen}Vote for the Next Map! {ColorDefault}---");
@@ -3456,7 +3499,18 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             // Random fallback picks among real maps only — silently extending when
             // nobody voted would be a do-nothing outcome.
             var mapOptions = _activeVoteOptions.Where(kv => kv.Value != ExtendOptionId).ToList();
-            if (mapOptions.Count == 0) return;
+            if (mapOptions.Count == 0)
+            {
+                // Shouldn't happen (StartMapVote aborts empty ballots), but never
+                // leave the plugin wedged: clear the HUD and allow a future vote.
+                _voteFinished = false;
+                _voteCenterHtmlCache = "";
+                if (Config.EnableVoteHud)
+                    foreach (var pl in GetHumanPlayers())
+                        try { pl.PrintToCenterHtml(" "); } catch { }
+                Log("VOTE", "Vote ended with no options and no votes — state reset.");
+                return;
+            }
             var pick = mapOptions[Random.Shared.Next(mapOptions.Count)];
             winningMapId = pick.Value; _nextMapName = GetMapName(winningMapId); voteCount = 0;
             Server.PrintToChatAll($" {ColorDefault}No votes cast! Randomly selecting a map...");
@@ -4135,7 +4189,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             int maxRounds = ConVar.Find("mp_maxrounds")?.GetPrimitiveValue<int>() ?? 0;
             bool canClinch = ConVar.Find("mp_match_can_clinch")?.GetPrimitiveValue<bool>() ?? true;
             int triggerRound = ComputeVoteTriggerRound(maxRounds, canClinch, Config.VoteRoundsBeforeEnd);
-            if (triggerRound <= 0) return HookResult.Continue; // no round limit — nothing to schedule against
+            if (triggerRound <= 0)
+            {
+                if (!_noRoundLimitWarned)
+                {
+                    _noRoundLimitWarned = true;
+                    Console.WriteLine("[CS2SimpleVote] vote_rounds_before_end is set but mp_maxrounds is 0 — the scheduled vote cannot fire on this server. Use !rtv, or set mp_maxrounds.");
+                }
+                return HookResult.Continue; // no round limit — nothing to schedule against
+            }
 
             var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault()?.GameRules;
             // ">=" rather than "==" so a plugin loaded (or cvars changed) mid-match

@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "nNXIGpR/DS4=",
+  "dgSpecHash": "/Fn1xO/ciV0=",
   "success": true,
-  "projectFilePath": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
+  "projectFilePath": "c:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\vindict6\\.nuget\\packages\\counterstrikesharp.api\\1.0.373\\counterstrikesharp.api.1.0.373.nupkg.sha512",
     "C:\\Users\\vindict6\\.nuget\\packages\\fastgenericnew\\3.3.1\\fastgenericnew.3.3.1.nupkg.sha512",
