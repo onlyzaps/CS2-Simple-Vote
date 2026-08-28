@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "c:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj": {}
+    "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj": {}
   },
   "projects": {
-    "c:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj": {
+    "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "c:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
+        "projectUniqueName": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
         "projectName": "CS2SimpleVote",
-        "projectPath": "c:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
+        "projectPath": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\CS2SimpleVote.csproj",
         "packagesPath": "C:\\Users\\vindict6\\.nuget\\packages\\",
-        "outputPath": "c:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\obj\\",
+        "outputPath": "C:\\Users\\vindict6\\Desktop\\SimnpleVote-StockEdit\\obj\\",
         "projectStyle": "PackageReference",
         "fallbackFolders": [
           "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

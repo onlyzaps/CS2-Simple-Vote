@@ -225,7 +225,7 @@ Players vote by **typing the option number in chat** as usual — the panel upda
 | Key | Default | Description |
 |---|---|---|
 | `last_synced_build` | `0` | Game build (`steam.inf`) the stock map list was last synced against |
-| `ConfigVersion` | `1` | Used by CounterStrikeSharp |
+| `ConfigVersion` | `2` | Config schema version. A legacy version-1 file (the original OnlyZaps layout) is migrated automatically at load: same-named keys carry over, `vote_on_round` becomes `vote_rounds_before_end`, the center-screen vote HUD stays off, and the file is rewritten in the new sectioned layout |
 
 ---
 

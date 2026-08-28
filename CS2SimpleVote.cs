@@ -18,6 +18,10 @@ namespace CS2SimpleVote;
 // file: sections, comments, and key order).
 public class VoteConfig : BasePluginConfig
 {
+    // Version 2 = the sectioned config + three-map-file layout. Version 1 is the
+    // legacy OnlyZaps layout, migrated in place by ApplyLegacyConfigMigration.
+    [JsonPropertyName("ConfigVersion")] public override int Version { get; set; } = 2;
+
     // Steam Workshop Collection
     [JsonPropertyName("steam_api_key")] public string SteamApiKey { get; set; } = "YOUR_STEAM_API_KEY_HERE";
     [JsonPropertyName("collection_id")] public string CollectionId { get; set; } = "123456789";
@@ -113,7 +117,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.8.5";
+    public override string ModuleVersion => "1.9.0";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -284,6 +288,52 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             Config.CollectionRefreshMinutes = 1.0f;
     }
 
+    private const int CurrentConfigVersion = 2;
+
+    // Detects a legacy (ConfigVersion 1 / missing) config file and migrates it onto
+    // the already-parsed Config: same-named keys are picked up by the deserializer
+    // on their own, so only renamed keys and features that postdate version 1 need
+    // handling here. Returns true when a migration happened (caller rewrites the
+    // file in the new layout).
+    private bool ApplyLegacyConfigMigration(string rawJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(rawJson, new JsonDocumentOptions
+            {
+                CommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true
+            });
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+            int version = root.TryGetProperty("ConfigVersion", out var v) && v.TryGetInt32(out int vi) ? vi : 1;
+            if (version >= CurrentConfigVersion) return false;
+
+            // Renamed key: vote_on_round (absolute round number) is now
+            // vote_rounds_before_end (rounds before the match can end). The value
+            // carries over so the scheduled vote stays enabled at a similar cadence,
+            // and the semantic change is called out loudly.
+            if (!root.TryGetProperty("vote_rounds_before_end", out _) &&
+                root.TryGetProperty("vote_on_round", out var vor) &&
+                vor.TryGetInt32(out int rounds) && rounds >= 0)
+            {
+                Config.VoteRoundsBeforeEnd = rounds;
+                Console.WriteLine($"[CS2SimpleVote] Migrated vote_on_round={rounds} -> vote_rounds_before_end={rounds}. NOTE: the new key counts rounds BEFORE the match can end, not an absolute round number — see CS2SimpleVote.README.md.");
+            }
+
+            // The center-screen vote HUD postdates version 1: a migrated config must
+            // come out with it off, regardless of what defaults ever become.
+            Config.EnableVoteHud = false;
+
+            Config.Version = CurrentConfigVersion;
+            ValidateConfig();
+            Console.WriteLine("[CS2SimpleVote] Legacy config (ConfigVersion 1) migrated to version 2 — rewriting CS2SimpleVote.json in the sectioned layout (values preserved).");
+            Log("CONFIG", "Legacy ConfigVersion 1 file migrated to version 2.");
+            return true;
+        }
+        catch { return false; }
+    }
+
     // Re-reads CS2SimpleVote.json from disk and applies it live. Called on every map
     // start so hand edits take effect on the next map without a plugin reload. Runs on
     // the game thread; a bad/partial file is caught and the previous config is kept.
@@ -292,9 +342,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (string.IsNullOrEmpty(_configFilePath) || !File.Exists(_configFilePath)) return;
 
         VoteConfig? parsed;
+        string json;
         try
         {
-            string json = File.ReadAllText(_configFilePath);
+            json = File.ReadAllText(_configFilePath);
             parsed = JsonSerializer.Deserialize<VoteConfig>(json, new JsonSerializerOptions
             {
                 ReadCommentHandling = JsonCommentHandling.Skip,
@@ -314,6 +365,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         Config = parsed;
         ValidateConfig();
+
+        // A legacy (version 1) file copied in mid-session migrates here too.
+        if (Config.Version < CurrentConfigVersion && ApplyLegacyConfigMigration(json))
+            GenerateConfigFiles(force: true);
 
         // If the collection or API key changed, refetch immediately so the new pool is
         // live this map instead of waiting for the next scheduled refresh.
@@ -515,7 +570,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                     E("last_synced_build", c.LastSyncedBuild,
                         "The game build (from `steam.inf`) the stock map list was last synced against. When this changes, `stock_maps.json` re-syncs from the engine: new maps appear disabled and removed maps are pruned."),
                     E("ConfigVersion", c.Version,
-                        "Used by CounterStrikeSharp."),
+                        "Config schema version — `2` is current. A legacy version-1 file (the original OnlyZaps layout) is migrated automatically at load: same-named keys carry over, `vote_on_round` becomes `vote_rounds_before_end`, and the center-screen vote HUD stays off."),
                 }),
         };
     }
@@ -702,9 +757,21 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             }
         }
 
+        // Legacy (ConfigVersion 1) files: translate renamed keys onto the parsed
+        // Config and force the rewrite below so the file comes back in the new
+        // sectioned layout, stamped version 2.
+        bool configMigrated = false;
+        try
+        {
+            if (File.Exists(_configFilePath))
+                configMigrated = ApplyLegacyConfigMigration(File.ReadAllText(_configFilePath));
+        }
+        catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Config migration check failed: {ex.Message}"); }
+
         // (Re)generate the sectioned config and the pristine example file. Forced
-        // when a new build number must be persisted into last_synced_build.
-        GenerateConfigFiles(force: buildChanged && build > 0);
+        // when a new build number must be persisted into last_synced_build, or when
+        // a legacy config was just migrated.
+        GenerateConfigFiles(force: configMigrated || (buildChanged && build > 0));
 
         RefreshMapPools(force: true);
 
