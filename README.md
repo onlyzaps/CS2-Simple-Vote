@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.6.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.7.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -20,7 +20,8 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 - **Match-aware scheduled votes** — the automatic vote opens `vote_rounds_before_end` rounds before the match can end, computed from `mp_maxrounds` and `mp_match_can_clinch`. No hardcoded round numbers to keep in sync with your server config.
 - **Extend option** — optionally adds `[0] Extend Current Map` to every vote (`0` or `!0` to cast); if it wins, the next map is the current one.
 - **Round-based or timed votes** — scheduled votes stay open for N rounds, or flip one flag to run them on a seconds timer instead (timed votes are never interrupted by round changes).
-- **Center-screen vote HUD** — optional live progress panel (options + running tallies) rendered natively, no resource plugins. Round-based votes flash it for 10s at each round end and at the vote's conclusion; timed votes keep it up all vote with a countdown.
+- **On-screen vote menu** — optional screen-space menu (options + running tallies) rendered with layered `point_worldtext` entities glued to your camera — the same technique screen-menu plugins use, reimplemented in-house with zero dependencies and no client files. **Hold SHIFT** to use it: movement freezes (your view stays free), W/S moves the highlight, E or LMB casts the vote, and your weapon can't fire while held. Release SHIFT and you're instantly back in the game. Round-based votes flash the menu for 10s at each round end and at the vote's conclusion; timed votes keep it up all vote with a countdown.
+- **CounterStrikeSharp admin support** — vote admin access via `@css/generic` / `@css/root`; the manual SteamID list still works.
 - **Recent-map exclusion** — the last `recent_maps_count` played maps are kept out of votes entirely: the random pool *and* nominations. Works for workshop and stock maps alike.
 - **Self-documenting config** — `CS2SimpleVote.json` is generated sectioned by feature with instructions above every setting, plus a pristine `CS2SimpleVote.example.json` for reference. Edits apply on the next map change, no restart.
 - **Hidden commands** — every command is intercepted silently and never spammed to public chat.
@@ -89,6 +90,7 @@ Run from the **server console**:
 | `css_forcemap <name>` | Force a map change |
 | `css_forcertv` | Start an RTV-style vote |
 | `css_dumpmaps` | Dump all enabled map names + IDs to console |
+| `css_syncstockmaps` | Force a re-scan of the engine's stock maps (logs the resolved maps folder) |
 
 ---
 
@@ -110,7 +112,10 @@ The plugin **generates it for you**, grouped into the sections below with instru
 
 | Key | Default | Description |
 |---|---|---|
-| `admins` | `[]` | SteamID64s allowed to use admin commands |
+| `use_css_admins` | `true` | Use CounterStrikeSharp's admin system: `@css/generic` or `@css/root` grants vote admin access |
+| `admins` | `[]` | Manual SteamID64 list — still honored alongside CSS admins |
+
+Grant permissions in `addons/counterstrikesharp/configs/admins.json`: players with `@css/generic` or `@css/root` may use every vote admin command (`!forcemap`, `!omitmap`, ...).
 
 ### Scheduled Vote Trigger
 
@@ -156,20 +161,25 @@ RTV votes are always timed (30 seconds) regardless of this setting.
 
 | Key | Default | Description |
 |---|---|---|
-| `enable_vote_hud` | `false` | Live center-screen progress panel; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
+| `enable_vote_hud` | `false` | On-screen vote menu; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
 
-Rendered natively with `PrintToCenterHtml` (styled after [cs2-rockthevote](https://github.com/Oz-Lin/cs2-rockthevote)'s panel) — nothing external to install:
+A screen-space menu built from four layered `point_worldtext` entities parented to your camera — the exact rendering technique of [CS2ScreenMenuAPI](https://github.com/T3Marius/CS2ScreenMenuAPI), reimplemented in-house and trimmed to just the vote menu: **no dependency, no client-side files**. A translucent backdrop panel, soft title/footer text, orange numbered options, and a bright glow over the selected row. Each player only ever sees their own menu (transmit-filtered).
 
 ```
 Vote for the Next Map!
-Time remaining: 42s        ← timed votes only
-!1 Dust II (3)
-!2 Mirage (1)
-!0 Extend Current Map (0)  ← when enable_extend_vote is on
+42s remaining                 ← timed votes only
+
+1. Dust II  (3)               ← glows when selected
+2. Mirage  (1)
+0. Extend Current Map  (0)    ← when enable_extend_vote is on
+
+Hold SHIFT to use this menu, or type the number in chat
 ```
 
-- **Round-based votes**: the panel is not up the whole vote — it appears for **10 seconds at the end of every round** the vote is open, and for **10 seconds at the vote's conclusion** (final tally + winner).
-- **Timed votes** (and all RTV votes): the panel stays up for the **entire vote** with a live countdown at the top, then shows the 10-second conclusion panel.
+**Using it**: **hold SHIFT** — movement freezes (your view stays free), your weapon can't fire, and **W/S** moves the selection while **E or LMB** casts (or changes) your vote. Release SHIFT and control returns instantly. Typing the option number in chat always works too. During a round-based vote, holding SHIFT also summons the menu outside its 10-second flash windows.
+
+- **Round-based votes**: the menu is not up the whole vote — it appears for **10 seconds at the end of every round** the vote is open, and for **10 seconds at the vote's conclusion** (final tally with the winner highlighted).
+- **Timed votes** (and all RTV votes): the menu stays up for the **entire vote** with a live countdown, then shows the 10-second conclusion.
 
 ### Vote Reminders
 
@@ -261,7 +271,7 @@ Your personal additions outside the collection — same format as above, generat
 
 Generated straight from the server engine — map names from the `.vpk` files in the game's `maps/` folder (vanity and other non-playable vpks excluded), display titles from the server's own localization (`SFUI_Map_*`). Nothing to curate by hand:
 
-- **First launch** writes every installed stock map, sorted by prefix (`ar_`, `cs_`, `de_`, ...) then alphabetically, all `"enabled": false`.
+- **First launch** writes every installed stock map, sorted by prefix (`ar_`, `cs_`, `de_`, ...) then alphabetically, all `"enabled": false`. The game folder is resolved by asking the engine itself (`Server.GameDirectory`, with a plugin-relative fallback) and the chosen path is logged; if the file ever fails to appear, run `css_syncstockmaps` from the server console to force a re-scan and see exactly which maps folder was used.
 - **Valve updates land by themselves**: the engine is re-scanned at plugin launch whenever the game build (`steam.inf`) differs from `last_synced_build` in the main config — new maps appear disabled, removed maps are deleted, and your `enabled` edits are always preserved. No scan runs when the build hasn't changed.
 - Enabled stock maps behave exactly like workshop maps everywhere: votes, RTV, nominations, `!forcemap` / `!setnextmap` (searchable by title *or* map name, e.g. `!nominate de_dust2`), omitting, and the recent-map exclusion.
 

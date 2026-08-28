@@ -1,8 +1,12 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
+using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Timers;
+using CounterStrikeSharp.API.Modules.Utils;
+using System.Drawing;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -22,6 +26,7 @@ public class VoteConfig : BasePluginConfig
     [JsonPropertyName("collection_refresh_minutes")] public float CollectionRefreshMinutes { get; set; } = 30.0f;
 
     // Admins
+    [JsonPropertyName("use_css_admins")] public bool UseCssAdmins { get; set; } = true;
     [JsonPropertyName("admins")] public List<ulong> Admins { get; set; } = new();
 
     // Scheduled Vote Trigger — the automatic vote starts this many rounds before
@@ -109,7 +114,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.6.0";
+    public override string ModuleVersion => "1.7.0";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -152,12 +157,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // _voteIsTimed: this vote ends on a timer (RTV, revote, or enable_timed_vote)
     // rather than on round ends. _voteEndsAtUtc is the absolute deadline — remaining
     // time is always derived from it, so a 0.5s render tick can't drift the countdown.
-    // _voteHudVisibleUntil drives the 10-second HUD flash windows in round-based
-    // votes; _voteHudOutroTimer replays the final tally for 10s after a vote ends.
+    // _voteHudVisibleUntil drives the 10-second menu flash windows in round-based
+    // votes.
     private bool _voteIsTimed;
     private DateTime _voteEndsAtUtc = DateTime.MinValue;
     private DateTime _voteHudVisibleUntil = DateTime.MinValue;
-    private CounterStrikeSharp.API.Modules.Timers.Timer? _voteHudOutroTimer;
 
     // State: current map identity.
     // _expectedMapId/Name are set right before EVERY plugin-initiated map change
@@ -375,8 +379,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Key("collection_refresh_minutes", c.CollectionRefreshMinutes);
 
         Section("Admins",
-            "SteamID64s allowed to use admin commands (!forcemap, !omitmap, ...).",
+            "use_css_admins: use CounterStrikeSharp's admin system for vote admin",
+            "access — players with @css/generic or @css/root may use the admin",
+            "commands. The manual \"admins\" SteamID64 list below keeps working",
+            "either way.",
             "Example: \"admins\": [76561198000000000, 76561198000000001]");
+        Key("use_css_admins", c.UseCssAdmins);
         Key("admins", c.Admins);
 
         Section("Scheduled Vote Trigger",
@@ -537,14 +545,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _stockMapsFilePath = Path.Combine(configDir, "stock_maps.json");
         _configFilePath = Path.Combine(configDir, "CS2SimpleVote.json");
 
-        // Engine folders for the stock map sync:
-        // ModuleDirectory is ".../game/csgo/addons/counterstrikesharp/plugins/CS2SimpleVote",
-        // so four levels up is the game's "csgo" directory, which holds maps/*.vpk and
-        // resource/csgo_english.txt.
-        string csgoDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "../../../.."));
-        _engineMapsDir = Path.Combine(csgoDir, "maps");
-        _engineLocalizationPath = Path.Combine(csgoDir, "resource", "csgo_english.txt");
-        _engineSteamInfPath = Path.Combine(csgoDir, "steam.inf");
+        // Engine folders for the stock map sync. The engine itself is asked first
+        // (Server.GameDirectory) so the maps folder is found regardless of where
+        // the plugin dll physically lives (symlinks, non-standard layouts); the
+        // ModuleDirectory-relative walk is only a fallback. Whichever candidate
+        // actually contains a maps/ folder wins, and the choice is logged so a
+        // missing stock_maps.json is diagnosable from the console.
+        ResolveEngineDirs();
         _logBaseDir = Path.Combine(configDir, "logs");
         try { Directory.CreateDirectory(_logBaseDir); } catch { /* non-fatal */ }
 
@@ -626,7 +633,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             if (caller != null)
             {
-                if (!Config.Admins.Contains(caller.SteamID))
+                if (!IsVoteAdmin(caller))
                 {
                     cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                     return;
@@ -653,7 +660,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             if (caller != null)
             {
-                if (!Config.Admins.Contains(caller.SteamID))
+                if (!IsVoteAdmin(caller))
                 {
                     cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                     return;
@@ -677,7 +684,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         AddCommand("css_forcertv", "Start an RTV-style map vote (map changes as soon as the vote ends)", (caller, cmdInfo) =>
         {
-            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            if (caller != null && !IsVoteAdmin(caller))
             {
                 cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                 return;
@@ -694,7 +701,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         AddCommand("css_addmap", "Add or re-enable a workshop map by ID (workshop_maps.json)", (caller, cmdInfo) =>
         {
-            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            if (caller != null && !IsVoteAdmin(caller))
             {
                 cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                 return;
@@ -704,7 +711,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         AddCommand("css_omitmap", "Disable maps matching the given words (removed from votes and nominations)", (caller, cmdInfo) =>
         {
-            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            if (caller != null && !IsVoteAdmin(caller))
             {
                 cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                 return;
@@ -714,7 +721,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         AddCommand("css_unomitmap", "Re-enable maps matching the given words", (caller, cmdInfo) =>
         {
-            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            if (caller != null && !IsVoteAdmin(caller))
             {
                 cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                 return;
@@ -724,7 +731,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         AddCommand("css_addlist", "List manually added workshop maps (workshop_maps.json)", (caller, cmdInfo) =>
         {
-            if (caller != null && !Config.Admins.Contains(caller.SteamID))
+            if (caller != null && !IsVoteAdmin(caller))
             {
                 cmdInfo.ReplyToCommand("You do not have permission to use this command.");
                 return;
@@ -738,6 +745,27 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 cmdInfo.ReplyToCommand($"  {TitleOf(e)}  (ID: {e.Id}){(e.Enabled ? "" : "  [disabled]")}");
             cmdInfo.ReplyToCommand($"--- End ({_workshopMaps.Count} entr(ies)) ---");
         });
+
+        AddCommand("css_syncstockmaps", "Force a re-scan of the engine's stock maps into stock_maps.json", (caller, cmdInfo) =>
+        {
+            if (caller != null && !IsVoteAdmin(caller))
+            {
+                cmdInfo.ReplyToCommand("You do not have permission to use this command.");
+                return;
+            }
+            _stockSyncWarned = false;          // re-print the folder warning if it still applies
+            ResolveEngineDirs();               // re-poll the engine in case paths changed
+            LoadEngineMapTitles();
+            SyncStockMapsConfig();
+            RefreshMapPools(force: true);
+            cmdInfo.ReplyToCommand($"[CS2SimpleVote] Stock map sync complete: {_stockMaps.Count} stock map(s) tracked ({_stockMaps.Count(e => e.Enabled)} enabled). Maps dir: {_engineMapsDir}");
+        });
+
+        // Per-tick driver for the on-screen vote menu (hold SHIFT to interact) and
+        // the transmit filter that keeps each player's menu entities visible only
+        // to them. Registered for the plugin's lifetime; both early-out when idle.
+        RegisterListener<Listeners.OnTick>(OnTickHudInput);
+        RegisterListener<Listeners.CheckTransmit>(OnCheckTransmit);
     }
 
     public override void Unload(bool hotReload)
@@ -758,8 +786,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _voteEndTimer = null;
         _mapChangeTimer?.Kill();
         _mapChangeTimer = null;
-        _voteHudOutroTimer?.Kill();
-        _voteHudOutroTimer = null;
         _collectionRefreshTimer?.Kill();
         _collectionRefreshTimer = null;
 
@@ -792,6 +818,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
 
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
+        RemoveListener<Listeners.OnTick>(OnTickHudInput);
+        RemoveListener<Listeners.CheckTransmit>(OnCheckTransmit);
+        DestroyAllScreenMenus();
 
         if (_playerChatDelegate != null)
         {
@@ -887,8 +916,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _mapChangeTimer?.Kill();
         _mapChangeTimer = null;
 
-        _voteHudOutroTimer?.Kill();
-        _voteHudOutroTimer = null;
+        // Map change: tear down every screen menu and any leftover outro.
+        _screenOutroUntil = DateTime.MinValue;
+        _screenOutroWinner = "";
+        DestroyAllScreenMenus();
     }
 
     // --- File Persistence ---
@@ -1236,6 +1267,48 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // sorted by prefix (ar_, cs_, de_, ...) then alphabetically.
 
     private static readonly Regex SfuiMapTitleRegex = new("^\\s*\"SFUI_Map_([^\"]+)\"\\s+\"(.+)\"", RegexOptions.Compiled);
+
+    // Polls the engine for the game directory and locates maps/, resource/ and
+    // steam.inf from it. Candidates, in order: Server.GameDirectory both as the
+    // ".../game" root (append csgo) and as ".../game/csgo" directly, then the
+    // plugin-relative walk (ModuleDirectory is ".../csgo/addons/counterstrikesharp/
+    // plugins/CS2SimpleVote", so four levels up is csgo). First candidate that
+    // actually contains a maps/ folder wins.
+    private void ResolveEngineDirs()
+    {
+        var candidates = new List<string>();
+        try
+        {
+            string gd = Server.GameDirectory;
+            if (!string.IsNullOrWhiteSpace(gd))
+            {
+                candidates.Add(Path.Combine(gd, "csgo"));
+                candidates.Add(gd);
+            }
+        }
+        catch { /* engine not available (e.g. tests) — fall through */ }
+        try { candidates.Add(Path.GetFullPath(Path.Combine(ModuleDirectory, "../../../.."))); } catch { }
+
+        string? csgoDir = candidates.FirstOrDefault(c =>
+        {
+            try { return Directory.Exists(Path.Combine(c, "maps")); }
+            catch { return false; }
+        });
+
+        if (csgoDir == null)
+        {
+            csgoDir = candidates.LastOrDefault() ?? "";
+            Console.WriteLine($"[CS2SimpleVote] WARNING: no maps/ folder found in any engine dir candidate: {string.Join(" | ", candidates)} — stock map sync will be inactive until css_syncstockmaps finds one.");
+        }
+        else
+        {
+            Console.WriteLine($"[CS2SimpleVote] Engine dir resolved: {csgoDir}");
+        }
+
+        _engineMapsDir = Path.Combine(csgoDir, "maps");
+        _engineLocalizationPath = Path.Combine(csgoDir, "resource", "csgo_english.txt");
+        _engineSteamInfPath = Path.Combine(csgoDir, "steam.inf");
+    }
 
     // Reads the game build number from the engine's steam.inf (ServerVersion=NNNNN).
     // Returns 0 when unavailable — the caller then falls back to syncing stock maps
@@ -1809,6 +1882,29 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         return null;
     }
 
+    // --- Admin gating ---
+    // Vote admin = may use admin commands (!forcemap, !omitmap, ...).
+    // With use_css_admins on, CounterStrikeSharp's admin system is the source of
+    // truth (@css/generic or @css/root); the manual "admins" SteamID list keeps
+    // working either way so nothing breaks when switching over. Console is always
+    // an admin.
+    private bool IsVoteAdmin(CCSPlayerController? p)
+    {
+        if (p == null) return true; // server console
+        if (!p.IsValid) return false;
+        if (Config.Admins.Contains(p.SteamID)) return true;
+        if (Config.UseCssAdmins)
+        {
+            try
+            {
+                if (AdminManager.PlayerHasPermissions(p, "@css/root")) return true;
+                if (AdminManager.PlayerHasPermissions(p, "@css/generic")) return true;
+            }
+            catch { /* admin system unavailable — fall through to manual list */ }
+        }
+        return false;
+    }
+
     private bool IsValidPlayer(CCSPlayerController? player) => player != null && player.IsValid && !player.IsBot && !player.IsHLTV;
     private bool IsWarmup()
     {
@@ -1921,6 +2017,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return HookResult.Handled;
         }
 
+
         if (_voteInProgress) return HandleVoteInput(p, cleanMsg);
 
         return HookResult.Continue;
@@ -1940,9 +2037,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (player != null && !IsValidPlayer(player)) return;
         
         bool isConsole = player == null;
-        if (!isConsole && !Config.Admins.Contains(player!.SteamID))
+        if (!isConsole && !IsVoteAdmin(player))
         {
-            player.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
+            player!.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
         }
 
@@ -2038,7 +2135,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        bool isAdmin = Config.Admins.Contains(p.SteamID);
+        bool isAdmin = IsVoteAdmin(p);
 
         p.PrintToChat($" {ColorDefault}---{ColorGreen} CS2SimpleVote Commands {ColorDefault}---");
 
@@ -2324,7 +2421,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2410,7 +2507,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2500,7 +2597,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2694,7 +2791,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2804,7 +2901,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2820,7 +2917,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2855,7 +2952,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     {
         if (!IsValidPlayer(player)) return;
         var p = player!;
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2883,7 +2980,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2906,7 +3003,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -2929,7 +3026,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault} You do not have permission to use this command.");
             return;
@@ -2966,7 +3063,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
 
-        if (!Config.Admins.Contains(p.SteamID))
+        if (!IsVoteAdmin(p))
         {
             p.PrintToChat($" {ColorDefault}You do not have permission to use this command.");
             return;
@@ -3032,10 +3129,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _playerVotes.Clear(); _activeVoteOptions.Clear(); _nominatingPlayers.Clear(); _playerNominationPage.Clear();
 
         // A previous vote's 10s outro (or a leftover flash window) must never overlay
-        // the new vote's HUD — a revote can start within seconds of the last result.
-        _voteHudOutroTimer?.Kill();
-        _voteHudOutroTimer = null;
+        // the new vote's menu — a revote can start within seconds of the last result.
+        _screenOutroUntil = DateTime.MinValue;
+        _screenOutroWinner = "";
         _voteHudVisibleUntil = DateTime.MinValue;
+        foreach (var m in _screenMenus.Values) m.LastRenderKey = null;
 
         // Nominations are re-checked against the freshly rebuilt pool AND the
         // recent-map list here, in case a map was disabled (file edit or !omitmap)
@@ -3113,14 +3211,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             {
                 if (Config.EnableVoteHud)
                 {
-                    // The HUD fully replaces the VOTE NOW prompt. Timed votes keep the
-                    // panel up for the whole vote (with the countdown at the top);
-                    // round-based votes only show it during the 10s flash windows
-                    // opened at round ends.
-                    bool visible = _voteIsTimed || DateTime.UtcNow <= _voteHudVisibleUntil;
-                    if (!visible) return;
-                    string html = BuildVoteHudHtml();
-                    foreach (var p in GetHumanPlayers()) p.PrintToCenterHtml(html);
+                    // The on-screen vote menu fully replaces the VOTE NOW prompt.
+                    // It is entity-based (point_worldtext) and driven per-tick in
+                    // OnTickHudInput — nothing to do here.
                 }
                 else
                 {
@@ -3211,8 +3304,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         Server.PrintToChatAll($" {ColorDefault}Winner: {ColorGreen}{winnerLabel}{ColorDefault}" + (voteCount > 0 ? $" with {ColorGreen}{voteCount}{ColorDefault} votes!" : " (Random/Previous)"));
         Server.PrintToChatAll($" {ColorDefault}{dashes}");
 
-        // Conclusion HUD: replay the final tally in the center of the screen for 10s.
-        StartVoteHudOutro(winnerLabel);
+        // Conclusion: keep the on-screen menu up for 10s showing the final tally.
+        StartScreenOutro(winnerLabel);
 
         _nominatedMaps.Clear(); _hasNominatedSteamIds.Clear(); _nominationOwner.Clear(); _nominationNames.Clear();
 
@@ -3271,62 +3364,428 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private int VoteSecondsRemaining()
         => _voteIsTimed ? Math.Max(0, (int)Math.Ceiling((_voteEndsAtUtc - DateTime.UtcNow).TotalSeconds)) : 0;
 
-    private static string HtmlEscape(string s)
-        => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+    // --- Screen vote menu (enable_vote_hud) ---
+    // An on-screen point_worldtext menu, reimplemented in-house from a close read of
+    // CS2ScreenMenuAPI's technique (MIT) and trimmed to exactly what the vote menu
+    // needs — no dependency, no client-side files. The look comes from four layered
+    // worldtext entities at staggered depth offsets, all parented to the player's
+    // predicted viewmodel so the panel is glued to the camera:
+    //   background : every line, translucent gray, DrawBackground=true (the panel)
+    //   dim        : title / countdown / footer lines (soft tan)
+    //   foreground : the numbered option lines (orange)
+    //   highlight  : the selected option only (translucent pale yellow — drawn over
+    //                the orange line it produces a bright "glow" selection)
+    // CheckTransmit strips each player's entities from everyone else's snapshot, so
+    // every player only ever sees their own menu.
+    //
+    // Interaction: the menu is display-only until the player HOLDS SHIFT — that
+    // freezes movement (view stays free) and locks weapon fire, then W/S moves the
+    // selection and E or LMB casts the vote (release-edge, like the reference
+    // implementation). Releasing SHIFT instantly returns control. Typing the option
+    // number in chat always works too.
 
-    // --- Center-screen vote HUD (enable_vote_hud) ---
-    // Rendered natively via PrintToCenterHtml — no external/resource plugins. The
-    // panel lists every option with its live tally, styled after cs2-rockthevote's
-    // vote panel:
-    //   Vote for the Next Map!
-    //   !1 Dust II (3)
-    //   !2 Mirage (1)
-    //   !0 Extend Current Map (0)
-    // Timed votes get a countdown line under the title.
+    private const string ScreenMenuFont = "Tahoma Bold";
+    private const int ScreenMenuFontSize = 32;
+    private const float ScreenMenuUnitsPerPx = 0.0085f;
+    private const float ScreenMenuX = -6.55f;   // right-vector offset (left of crosshair)
+    private const float ScreenMenuY = 1.2f;     // up-vector offset
+    private static readonly Color ScreenHighlightColor = Color.FromArgb(127, 255, 255, 64);
+    private static readonly Color ScreenForegroundColor = Color.FromArgb(230, 153, 39);
+    private static readonly Color ScreenDimColor = Color.FromArgb(234, 209, 175);
+    private static readonly Color ScreenBackgroundColor = Color.FromArgb(125, 127, 127, 127);
 
-    private string BuildVoteHudHtml()
+    private class ScreenVoteMenu
     {
-        var sb = new StringBuilder();
-        sb.Append("<font color='#7CFC00'><b>Vote for the Next Map!</b></font>");
-        if (_voteIsTimed)
-            sb.Append($"<br><font color='#FFD700'>Time remaining: {VoteSecondsRemaining()}s</font>");
+        public CPointWorldText? Background, Dim, Foreground, Highlight;
+        public nint CreatedForPawn = nint.Zero;
+        public int Selection;
+        public bool Engaged;
+        public PlayerButtons LastButtons;
+        public string? LastRenderKey;
+
+        public IEnumerable<CPointWorldText?> Entities()
+        {
+            yield return Background; yield return Dim; yield return Foreground; yield return Highlight;
+        }
+    }
+
+    private readonly Dictionary<int, ScreenVoteMenu> _screenMenus = new();
+    private DateTime _screenOutroUntil = DateTime.MinValue;
+    private string _screenOutroWinner = "";
+
+    // The pawn whose camera the player is looking through (own pawn, or the observed
+    // pawn while dead) — the menu must attach to THAT pawn's viewmodel.
+    private static CCSPlayerPawn? GetViewPawn(CCSPlayerController player)
+    {
+        if (player.Pawn.Value is not CBasePlayerPawn pawn) return null;
+        if (pawn.LifeState == (byte)LifeState_t.LIFE_DEAD)
+        {
+            if (pawn.ObserverServices?.ObserverTarget.Value?.As<CBasePlayerPawn>() is not CBasePlayerPawn observed)
+                return null;
+            pawn = observed;
+        }
+        return pawn.As<CCSPlayerPawn>();
+    }
+
+    // Fetches (or creates) the predicted viewmodel the worldtext entities parent to.
+    // This CounterStrikeSharp build generates no viewmodel wrapper classes, so both
+    // the services component pointer and the m_hViewModel offset are resolved by
+    // name straight from the game's own schema system at runtime. The entity is
+    // only ever handed to SetParent, so the CBaseEntity wrapper is all we need.
+    private static CBaseEntity? EnsureCustomView(CCSPlayerPawn pawn)
+    {
+        nint services = Schema.GetSchemaValue<nint>(pawn.Handle, "CCSPlayerPawnBase", "m_pViewModelServices");
+        if (services == nint.Zero) return null;
+        int offset = Schema.GetSchemaOffset("CCSPlayer_ViewModelServices", "m_hViewModel");
+        var handle = new CHandle<CBaseEntity>((IntPtr)(services + offset + 4));
+        if (!handle.IsValid)
+        {
+            var viewmodel = Utilities.CreateEntityByName<CBaseEntity>("predicted_viewmodel");
+            if (viewmodel == null) return null;
+            viewmodel.DispatchSpawn();
+            handle.Raw = viewmodel.EntityHandle.Raw;
+            Utilities.SetStateChanged(pawn, "CCSPlayerPawnBase", "m_pViewModelServices");
+        }
+        return handle.Value;
+    }
+
+    // Panel transform in front of the camera: eye position + forward*7 with the
+    // side/up offsets scaled for non-90 FOVs, angled to face the player.
+    private static (Vector pos, QAngle ang) ComputeMenuTransform(CCSPlayerController player, CCSPlayerPawn pawn)
+    {
+        QAngle eye = pawn.EyeAngles;
+        Vector forward = new(), right = new(), up = new();
+        NativeAPI.AngleVectors(eye.Handle, forward.Handle, right.Handle, up.Handle);
+
+        float fov = player.DesiredFOV == 0 ? 90 : player.DesiredFOV;
+        float scale = fov == 90 ? 1.0f : (float)Math.Tan(fov / 2 * Math.PI / 180) / (float)Math.Tan(45 * Math.PI / 180);
+
+        Vector pos = pawn.AbsOrigin! + new Vector(0, 0, pawn.ViewOffset.Z)
+                   + forward * 7.0f + right * (ScreenMenuX * scale) + up * (ScreenMenuY * scale);
+        QAngle ang = new() { X = 0, Y = eye.Y + 270.0f, Z = 90.0f - eye.X };
+        return (pos, ang);
+    }
+
+    private static CPointWorldText? CreateMenuText(Color color, bool drawBackground, float depthOffset)
+    {
+        var ent = Utilities.CreateEntityByName<CPointWorldText>("point_worldtext");
+        if (ent is not { IsValid: true }) return null;
+        ent.MessageText = "";
+        ent.Enabled = true;
+        ent.FontName = ScreenMenuFont;
+        ent.FontSize = ScreenMenuFontSize;
+        ent.Fullbright = true;
+        ent.Color = color;
+        ent.WorldUnitsPerPx = ScreenMenuUnitsPerPx;
+        ent.JustifyHorizontal = PointWorldTextJustifyHorizontal_t.POINT_WORLD_TEXT_JUSTIFY_HORIZONTAL_LEFT;
+        ent.JustifyVertical = PointWorldTextJustifyVertical_t.POINT_WORLD_TEXT_JUSTIFY_VERTICAL_TOP;
+        ent.ReorientMode = PointWorldTextReorientMode_t.POINT_WORLD_TEXT_REORIENT_NONE;
+        ent.RenderMode = RenderMode_t.kRenderNormal;
+        ent.DrawBackground = drawBackground;
+        ent.BackgroundBorderHeight = 0.1f;
+        ent.BackgroundBorderWidth = 0.1f;
+        ent.BackgroundWorldToUV = 0.05f;
+        ent.DepthOffset = depthOffset;
+        ent.DispatchSpawn();
+        return ent;
+    }
+
+    // (Re)creates a player's menu entities when missing or when their view pawn
+    // changed (respawn, spectate switch). Returns false when no view is available.
+    private bool EnsureScreenMenuEntities(CCSPlayerController player, ScreenVoteMenu menu)
+    {
+        var pawn = GetViewPawn(player);
+        if (pawn == null || !pawn.IsValid) return false;
+
+        bool allValid = menu.Entities().All(e => e is { IsValid: true });
+        if (allValid && menu.CreatedForPawn == pawn.Handle) return true;
+
+        DestroyScreenMenuEntities(menu);
+        var viewmodel = EnsureCustomView(pawn);
+        if (viewmodel == null) return false;
+        var (pos, ang) = ComputeMenuTransform(player, pawn);
+
+        // The first worldtext created for a pawn does not render — create and
+        // immediately discard a throwaway one (reference implementation quirk).
+        var warmup = CreateMenuText(ScreenDimColor, false, 0f);
+        if (warmup != null)
+        {
+            warmup.Teleport(pos, ang, null);
+            warmup.AcceptInput("SetParent", viewmodel, null, "!activator");
+            warmup.Remove();
+        }
+
+        menu.Background = CreateMenuText(ScreenBackgroundColor, true, -0.002f);
+        menu.Dim = CreateMenuText(ScreenDimColor, false, -0.001f);
+        menu.Foreground = CreateMenuText(ScreenForegroundColor, false, 0.000f);
+        menu.Highlight = CreateMenuText(ScreenHighlightColor, false, 0.001f);
+        foreach (var ent in menu.Entities())
+        {
+            if (ent is not { IsValid: true }) continue;
+            ent.Teleport(pos, ang, null);
+            ent.AcceptInput("SetParent", viewmodel, null, "!activator");
+        }
+        menu.CreatedForPawn = pawn.Handle;
+        menu.LastRenderKey = null;
+        return true;
+    }
+
+    private void DestroyScreenMenuEntities(ScreenVoteMenu menu)
+    {
+        foreach (var ent in menu.Entities())
+            if (ent is { IsValid: true }) ent.Remove();
+        menu.Background = menu.Dim = menu.Foreground = menu.Highlight = null;
+        menu.CreatedForPawn = nint.Zero;
+        menu.LastRenderKey = null;
+    }
+
+    private void DestroyScreenMenu(CCSPlayerController? player, int slot)
+    {
+        if (!_screenMenus.TryGetValue(slot, out var menu)) return;
+        if (menu.Engaged)
+        {
+            menu.Engaged = false;
+            try
+            {
+                var pawn = player?.PlayerPawn.Value;
+                if (pawn != null && pawn.IsValid) UnfreezePawn(pawn);
+            }
+            catch { }
+        }
+        DestroyScreenMenuEntities(menu);
+        _screenMenus.Remove(slot);
+    }
+
+    private void DestroyAllScreenMenus()
+    {
+        foreach (var slot in _screenMenus.Keys.ToList())
+            DestroyScreenMenu(Utilities.GetPlayerFromSlot(slot), slot);
+    }
+
+    // Builds the four text layers. Layers share the line grid — a line a layer does
+    // not draw is an empty line there, so everything stays aligned. Selection shows
+    // as the pale-yellow highlight drawn over the orange option line.
+    private (string bg, string dim, string fg, string hl) BuildVoteMenuLines(int selection, bool engaged)
+    {
+        var bg = new StringBuilder(); var dim = new StringBuilder();
+        var fg = new StringBuilder(); var hl = new StringBuilder();
+        void Line(string text, bool isOption = false, bool isSelected = false)
+        {
+            bg.AppendLine(text);
+            dim.AppendLine(isOption ? "" : text);
+            fg.AppendLine(isOption ? text : "");
+            hl.AppendLine(isSelected ? text : "");
+        }
+
+        bool outro = _screenOutroWinner.Length > 0 && DateTime.UtcNow <= _screenOutroUntil;
+        Line(outro ? "Vote Finished!" : "Vote for the Next Map!");
+        if (!outro && _voteIsTimed) Line($"{VoteSecondsRemaining()}s remaining");
+        Line(" ");
+
+        int i = 0;
         foreach (var kvp in OrderedVoteOptions())
         {
             int votes = _playerVotes.Values.Count(v => v == kvp.Key);
-            sb.Append($"<br><font color='#7CFC00'>!{kvp.Key}</font> <font color='#FFFFFF'>{HtmlEscape(OptionName(kvp.Value))}</font> <font color='#B0B0B0'>({votes})</font>");
+            string text = $"{kvp.Key}. {OptionName(kvp.Value)}  ({votes})";
+            bool selected = outro ? OptionName(kvp.Value) == _screenOutroWinner : (engaged && i == selection);
+            Line(text, isOption: true, isSelected: selected);
+            i++;
         }
-        return sb.ToString();
+
+        Line(" ");
+        if (outro)
+            Line($"Winner: {_screenOutroWinner}");
+        else
+            Line(engaged ? "W/S move · E or LMB vote · release SHIFT to exit"
+                         : "Hold SHIFT to use this menu, or type the number in chat");
+
+        return (bg.ToString(), dim.ToString(), fg.ToString(), hl.ToString());
     }
 
-    private string BuildVoteOutroHtml(string winnerLabel)
+    private void RenderScreenMenu(ScreenVoteMenu menu)
     {
-        var sb = new StringBuilder();
-        sb.Append("<font color='#7CFC00'><b>Vote Finished!</b></font>");
-        foreach (var kvp in OrderedVoteOptions())
+        var (bg, dim, fg, hl) = BuildVoteMenuLines(menu.Selection, menu.Engaged);
+        string key = $"{bg}{hl}";
+        if (key == menu.LastRenderKey) return;
+        menu.LastRenderKey = key;
+
+        void Apply(CPointWorldText? ent, string text)
         {
-            int votes = _playerVotes.Values.Count(v => v == kvp.Key);
-            sb.Append($"<br><font color='#7CFC00'>!{kvp.Key}</font> <font color='#FFFFFF'>{HtmlEscape(OptionName(kvp.Value))}</font> <font color='#B0B0B0'>({votes})</font>");
+            if (ent is not { IsValid: true }) return;
+            ent.MessageText = text;
+            Utilities.SetStateChanged(ent, "CPointWorldText", "m_messageText");
         }
-        sb.Append($"<br><font color='#FFD700'><b>Winner: {HtmlEscape(winnerLabel)}</b></font>");
-        return sb.ToString();
+        Apply(menu.Background, bg);
+        Apply(menu.Dim, dim);
+        Apply(menu.Foreground, fg);
+        Apply(menu.Highlight, hl);
     }
 
-    // Replays the final tally in the center of the screen for 10 seconds after a
-    // vote concludes. The HTML is snapshotted once — the tallies are final.
-    private void StartVoteHudOutro(string winnerLabel)
+    private void OnTickHudInput()
     {
-        if (!Config.EnableVoteHud || _unloaded) return;
-        string html = BuildVoteOutroHtml(winnerLabel);
-        _voteHudOutroTimer?.Kill();
-        int ticks = 0;
-        _voteHudOutroTimer = AddTimer(0.5f, () =>
+        if (_unloaded) return;
+        bool outroActive = DateTime.UtcNow <= _screenOutroUntil;
+        bool hudActive = Config.EnableVoteHud && (_voteInProgress || outroActive) && _activeVoteOptions.Count > 0;
+        if (!hudActive)
         {
-            if (_unloaded) return;
-            if (++ticks > 20) { _voteHudOutroTimer?.Kill(); _voteHudOutroTimer = null; return; }
-            try { foreach (var p in GetHumanPlayers()) p.PrintToCenterHtml(html); }
-            catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Vote HUD outro error: {ex.Message}"); }
-        }, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
+            if (_screenMenus.Count > 0) DestroyAllScreenMenus();
+            if (!outroActive) _screenOutroWinner = "";
+            return;
+        }
+
+        foreach (var player in GetHumanPlayers())
+        {
+            try { TickScreenMenu(player, outroActive); }
+            catch (Exception ex) { Console.WriteLine($"[CS2SimpleVote] Screen menu tick error: {ex.Message}"); }
+        }
     }
+
+    private void TickScreenMenu(CCSPlayerController player, bool outroActive)
+    {
+        _screenMenus.TryGetValue(player.Slot, out var menu);
+        bool shiftHeld = !outroActive && (player.Buttons & PlayerButtons.Speed) != 0 && player.PawnIsAlive;
+
+        // Visibility: outro and timed votes always show; round-based votes show
+        // during the 10s round-end windows, or whenever the player holds SHIFT.
+        bool visible = outroActive || _voteIsTimed || DateTime.UtcNow <= _voteHudVisibleUntil
+                       || shiftHeld || (menu?.Engaged ?? false);
+        if (!visible)
+        {
+            if (menu != null) DestroyScreenMenu(player, player.Slot);
+            return;
+        }
+
+        menu ??= _screenMenus[player.Slot] = new ScreenVoteMenu();
+
+        // Engage/disengage the SHIFT capture (vote phase only).
+        if (shiftHeld && !menu.Engaged)
+        {
+            var pawn = player.PlayerPawn.Value;
+            if (pawn != null && pawn.IsValid)
+            {
+                menu.Engaged = true;
+                menu.LastButtons = player.Buttons;
+                int rows = _activeVoteOptions.Count;
+                menu.Selection = Math.Clamp(menu.Selection, 0, Math.Max(0, rows - 1));
+                FreezePawn(pawn);
+            }
+        }
+        else if (!shiftHeld && menu.Engaged)
+        {
+            menu.Engaged = false;
+            try
+            {
+                var pawn = player.PlayerPawn.Value;
+                if (pawn != null && pawn.IsValid) UnfreezePawn(pawn);
+            }
+            catch { }
+        }
+
+        if (menu.Engaged)
+        {
+            var pawn = player.PlayerPawn.Value;
+            if (pawn == null || !pawn.IsValid || !player.PawnIsAlive)
+            {
+                menu.Engaged = false;
+            }
+            else
+            {
+                SuppressWeaponFire(pawn);
+                int rows = _activeVoteOptions.Count;
+                var buttons = player.Buttons;
+                // Release-edge input, per the reference implementation.
+                bool Released(PlayerButtons b) => (buttons & b) == 0 && (menu.LastButtons & b) != 0;
+                if (rows > 0)
+                {
+                    if (Released(PlayerButtons.Forward)) menu.Selection = (menu.Selection - 1 + rows) % rows;
+                    else if (Released(PlayerButtons.Back)) menu.Selection = (menu.Selection + 1) % rows;
+                    else if (Released(PlayerButtons.Use) || Released(PlayerButtons.Attack))
+                    {
+                        var options = OrderedVoteOptions().ToList();
+                        if (menu.Selection < options.Count)
+                        {
+                            var kvp = options[menu.Selection];
+                            _playerVotes[player.Slot] = kvp.Key;
+                            string name = OptionName(kvp.Value);
+                            Log("VOTE", $"{PlayerTag(player)} voted (menu) for option {kvp.Key}: {name} ({kvp.Value})");
+                            player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{name}{ColorDefault}");
+                        }
+                    }
+                }
+                menu.LastButtons = buttons;
+            }
+        }
+
+        if (!EnsureScreenMenuEntities(player, menu)) return;
+        RenderScreenMenu(menu);
+    }
+
+    // Shows the final tally + winner on the menu for 10 seconds after the vote.
+    private void StartScreenOutro(string winnerLabel)
+    {
+        if (!Config.EnableVoteHud) return;
+        _screenOutroWinner = winnerLabel;
+        _screenOutroUntil = DateTime.UtcNow.AddSeconds(10);
+        foreach (var kv in _screenMenus)
+        {
+            var menu = kv.Value;
+            if (menu.Engaged)
+            {
+                menu.Engaged = false;
+                try
+                {
+                    var pawn = Utilities.GetPlayerFromSlot(kv.Key)?.PlayerPawn.Value;
+                    if (pawn != null && pawn.IsValid) UnfreezePawn(pawn);
+                }
+                catch { }
+            }
+            menu.LastRenderKey = null;
+        }
+    }
+
+    // Each player's menu entities are visible only to them.
+    private void OnCheckTransmit(CCheckTransmitInfoList infoList)
+    {
+        if (_screenMenus.Count == 0) return;
+        foreach ((CCheckTransmitInfo info, CCSPlayerController? player) in infoList)
+        {
+            if (player == null) continue;
+            foreach (var kv in _screenMenus)
+            {
+                if (kv.Key == player.Slot) continue;
+                foreach (var ent in kv.Value.Entities())
+                    if (ent is { IsValid: true }) info.TransmitEntities.Remove(ent);
+            }
+        }
+    }
+
+    private static void FreezePawn(CCSPlayerPawn pawn)
+    {
+        // m_nActualMoveType is byte-backed — write the enum (1 byte), not an int.
+        pawn.MoveType = MoveType_t.MOVETYPE_OBSOLETE;
+        Schema.SetSchemaValue(pawn.Handle, "CBaseEntity", "m_nActualMoveType", MoveType_t.MOVETYPE_OBSOLETE);
+        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
+    }
+
+    private static void UnfreezePawn(CCSPlayerPawn pawn)
+    {
+        pawn.MoveType = MoveType_t.MOVETYPE_WALK;
+        Schema.SetSchemaValue(pawn.Handle, "CBaseEntity", "m_nActualMoveType", MoveType_t.MOVETYPE_WALK);
+        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
+    }
+
+    // Push the active weapon's attack ticks into the future so a menu click never
+    // fires the gun. Re-applied every engaged tick; recovers by itself on release.
+    private static void SuppressWeaponFire(CCSPlayerPawn pawn)
+    {
+        var weapon = pawn.WeaponServices?.ActiveWeapon.Value;
+        if (weapon == null || !weapon.IsValid) return;
+        weapon.NextPrimaryAttackTick = Server.TickCount + 64;
+        weapon.NextSecondaryAttackTick = Server.TickCount + 64;
+        Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_nNextPrimaryAttackTick");
+        Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_nNextSecondaryAttackTick");
+    }
+
     private string GetMapName(string mapId)
     {
         // Search ALL known maps so names stay resolvable even for a map that was
@@ -3474,6 +3933,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             CloseNominationMenu(player);
             CloseForcemapMenu(player);
             CloseSetNextMapMenu(player);
+            DestroyScreenMenu(player, player.Slot);
 
             // A departure lowers the RTV threshold — re-check so the remaining voters
             // aren't left stuck at e.g. 3/3 with no way to trigger the vote.
