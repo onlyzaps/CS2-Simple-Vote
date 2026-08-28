@@ -114,7 +114,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.7.0";
+    public override string ModuleVersion => "1.7.1";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -616,6 +616,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         AddCommandListener("say", _playerChatDelegate, HookMode.Pre);
         AddCommandListener("say_team", _playerChatDelegate, HookMode.Pre);
 
+        // The voice-commands wheel drives the on-screen vote menu: engaged while
+        // +radialradio is held, released on -radialradio. HookMode.Pre + Continue,
+        // so the wheel itself keeps working normally.
+        AddCommandListener("+radialradio", OnRadialRadioDown, HookMode.Pre);
+        AddCommandListener("-radialradio", OnRadialRadioUp, HookMode.Pre);
+
         AddCommand("css_dumpmaps", "Dump all available map names to console", (caller, cmdInfo) =>
         {
             if (caller != null) { cmdInfo.ReplyToCommand("This command can only be used from the server console."); return; }
@@ -828,6 +834,9 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             RemoveCommandListener("say_team", _playerChatDelegate, HookMode.Pre);
             _playerChatDelegate = null;
         }
+        RemoveCommandListener("+radialradio", OnRadialRadioDown, HookMode.Pre);
+        RemoveCommandListener("-radialradio", OnRadialRadioUp, HookMode.Pre);
+        _voiceMenuHeld.Clear();
 
         // 7. Dispose managed resources and recreate for potential hot reload
         _cts.Dispose();
@@ -919,6 +928,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // Map change: tear down every screen menu and any leftover outro.
         _screenOutroUntil = DateTime.MinValue;
         _screenOutroWinner = "";
+        _voiceMenuHeld.Clear();
         DestroyAllScreenMenus();
     }
 
@@ -3413,6 +3423,23 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private DateTime _screenOutroUntil = DateTime.MinValue;
     private string _screenOutroWinner = "";
 
+    // Slots currently holding the voice-commands wheel open (+radialradio held).
+    // The wheel's own client-side cursor appears and the mouse stops turning the
+    // view while it's open, which is exactly the window our menu is driven in.
+    private readonly HashSet<int> _voiceMenuHeld = new();
+
+    private HookResult OnRadialRadioDown(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player != null && player.IsValid) _voiceMenuHeld.Add(player.Slot);
+        return HookResult.Continue;
+    }
+
+    private HookResult OnRadialRadioUp(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player != null && player.IsValid) _voiceMenuHeld.Remove(player.Slot);
+        return HookResult.Continue;
+    }
+
     // The pawn whose camera the player is looking through (own pawn, or the observed
     // pawn while dead) — the menu must attach to THAT pawn's viewmodel.
     private static CCSPlayerPawn? GetViewPawn(CCSPlayerController player)
@@ -3427,29 +3454,13 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         return pawn.As<CCSPlayerPawn>();
     }
 
-    // Fetches (or creates) the predicted viewmodel the worldtext entities parent to.
-    // CounterStrikeSharp removed the typed viewmodel wrapper classes (CCSGOViewModel /
-    // ViewModelServices) after ~v1.0.318 — screen-menu libraries pin that ancient
-    // build to keep them. On current CSS the supported approach is this one: resolve
-    // the services component pointer and the m_hViewModel offset by name from the
-    // game's own schema system at runtime. The entity is only ever handed to
-    // SetParent, so the CBaseEntity wrapper is all we need.
-    private static CBaseEntity? EnsureCustomView(CCSPlayerPawn pawn)
-    {
-        nint services = Schema.GetSchemaValue<nint>(pawn.Handle, "CCSPlayerPawnBase", "m_pViewModelServices");
-        if (services == nint.Zero) return null;
-        int offset = Schema.GetSchemaOffset("CCSPlayer_ViewModelServices", "m_hViewModel");
-        var handle = new CHandle<CBaseEntity>((IntPtr)(services + offset + 4));
-        if (!handle.IsValid)
-        {
-            var viewmodel = Utilities.CreateEntityByName<CBaseEntity>("predicted_viewmodel");
-            if (viewmodel == null) return null;
-            viewmodel.DispatchSpawn();
-            handle.Raw = viewmodel.EntityHandle.Raw;
-            Utilities.SetStateChanged(pawn, "CCSPlayerPawnBase", "m_pViewModelServices");
-        }
-        return handle.Value;
-    }
+    // NOTE on attachment: the classic screen-menu trick parented worldtext to the
+    // player's predicted viewmodel, but Valve removed server-side viewmodels from
+    // CS2 (the server schema no longer has CCSPlayer_ViewModelServices/m_hViewModel
+    // at all — verified against a current schema dump). The reference library's own
+    // fallback path is what works today: parent the entities to the view pawn for
+    // PVS/transmit, and re-aim them onto the camera every tick from the pawn's eye
+    // transform (see RepositionScreenMenu, called each tick).
 
     // Panel transform in front of the camera: eye position + forward*7 with the
     // side/up offsets scaled for non-90 FOVs, angled to face the player.
@@ -3503,8 +3514,6 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (allValid && menu.CreatedForPawn == pawn.Handle) return true;
 
         DestroyScreenMenuEntities(menu);
-        var viewmodel = EnsureCustomView(pawn);
-        if (viewmodel == null) return false;
         var (pos, ang) = ComputeMenuTransform(player, pawn);
 
         // The first worldtext created for a pawn does not render — create and
@@ -3513,7 +3522,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (warmup != null)
         {
             warmup.Teleport(pos, ang, null);
-            warmup.AcceptInput("SetParent", viewmodel, null, "!activator");
+            warmup.AcceptInput("SetParent", pawn, null, "!activator");
             warmup.Remove();
         }
 
@@ -3525,11 +3534,23 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             if (ent is not { IsValid: true }) continue;
             ent.Teleport(pos, ang, null);
-            ent.AcceptInput("SetParent", viewmodel, null, "!activator");
+            ent.AcceptInput("SetParent", pawn, null, "!activator");
         }
         menu.CreatedForPawn = pawn.Handle;
         menu.LastRenderKey = null;
         return true;
+    }
+
+    // Re-aims the panel onto the camera every tick (absolute teleport recomputes the
+    // parent-relative offset). This is what keeps the menu glued to the view now
+    // that server-side viewmodels no longer exist to parent to.
+    private void RepositionScreenMenu(CCSPlayerController player, ScreenVoteMenu menu)
+    {
+        var pawn = GetViewPawn(player);
+        if (pawn == null || !pawn.IsValid) return;
+        var (pos, ang) = ComputeMenuTransform(player, pawn);
+        foreach (var ent in menu.Entities())
+            if (ent is { IsValid: true }) ent.Teleport(pos, ang, null);
     }
 
     private void DestroyScreenMenuEntities(ScreenVoteMenu menu)
@@ -3598,8 +3619,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (outro)
             Line($"Winner: {_screenOutroWinner}");
         else
-            Line(engaged ? "W/S move · E or LMB vote · release SHIFT to exit"
-                         : "Hold SHIFT to use this menu, or type the number in chat");
+            Line(engaged ? "W/S move · E to vote · close the wheel to exit"
+                         : "Hold your voice-commands key (Z) to use this menu, or type the number in chat");
 
         return (bg.ToString(), dim.ToString(), fg.ToString(), hl.ToString());
     }
@@ -3645,12 +3666,15 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private void TickScreenMenu(CCSPlayerController player, bool outroActive)
     {
         _screenMenus.TryGetValue(player.Slot, out var menu);
-        bool shiftHeld = !outroActive && (player.Buttons & PlayerButtons.Speed) != 0 && player.PawnIsAlive;
+        // Interaction is held open by the voice-commands wheel: engaged from
+        // +radialradio until -radialradio. The wheel conveniently shows the game's
+        // own mouse cursor client-side and stops the mouse from turning the view.
+        bool voiceHeld = !outroActive && _voiceMenuHeld.Contains(player.Slot) && player.PawnIsAlive;
 
         // Visibility: outro and timed votes always show; round-based votes show
-        // during the 10s round-end windows, or whenever the player holds SHIFT.
+        // during the 10s round-end windows, or while the voice wheel is held.
         bool visible = outroActive || _voteIsTimed || DateTime.UtcNow <= _voteHudVisibleUntil
-                       || shiftHeld || (menu?.Engaged ?? false);
+                       || voiceHeld || (menu?.Engaged ?? false);
         if (!visible)
         {
             if (menu != null) DestroyScreenMenu(player, player.Slot);
@@ -3659,8 +3683,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
         menu ??= _screenMenus[player.Slot] = new ScreenVoteMenu();
 
-        // Engage/disengage the SHIFT capture (vote phase only).
-        if (shiftHeld && !menu.Engaged)
+        // Engage/disengage the voice-wheel capture (vote phase only).
+        if (voiceHeld && !menu.Engaged)
         {
             var pawn = player.PlayerPawn.Value;
             if (pawn != null && pawn.IsValid)
@@ -3672,7 +3696,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 FreezePawn(pawn);
             }
         }
-        else if (!shiftHeld && menu.Engaged)
+        else if (!voiceHeld && menu.Engaged)
         {
             menu.Engaged = false;
             try
@@ -3719,6 +3743,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         }
 
         if (!EnsureScreenMenuEntities(player, menu)) return;
+        RepositionScreenMenu(player, menu);
         RenderScreenMenu(menu);
     }
 
@@ -3935,6 +3960,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             CloseNominationMenu(player);
             CloseForcemapMenu(player);
             CloseSetNextMapMenu(player);
+            _voiceMenuHeld.Remove(player.Slot);
             DestroyScreenMenu(player, player.Slot);
 
             // A departure lowers the RTV threshold — re-check so the remaining voters

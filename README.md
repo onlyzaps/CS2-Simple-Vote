@@ -3,7 +3,7 @@
 A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike 2 ([CounterStrikeSharp](https://docs.cssharp.dev/)). RTV, nominations, scheduled votes, and live map management — no database, no fuss.
 
 <p align="left">
-  <img alt="version" src="https://img.shields.io/badge/version-1.7.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.7.1-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
 </p>
 
@@ -20,7 +20,7 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 - **Match-aware scheduled votes** — the automatic vote opens `vote_rounds_before_end` rounds before the match can end, computed from `mp_maxrounds` and `mp_match_can_clinch`. No hardcoded round numbers to keep in sync with your server config.
 - **Extend option** — optionally adds `[0] Extend Current Map` to every vote (`0` or `!0` to cast); if it wins, the next map is the current one.
 - **Round-based or timed votes** — scheduled votes stay open for N rounds, or flip one flag to run them on a seconds timer instead (timed votes are never interrupted by round changes).
-- **On-screen vote menu** — optional screen-space menu (options + running tallies) rendered with layered `point_worldtext` entities glued to your camera — the same technique screen-menu plugins use, reimplemented in-house with zero dependencies and no client files. **Hold SHIFT** to use it: movement freezes (your view stays free), W/S moves the highlight, E or LMB casts the vote, and your weapon can't fire while held. Release SHIFT and you're instantly back in the game. Round-based votes flash the menu for 10s at each round end and at the vote's conclusion; timed votes keep it up all vote with a countdown.
+- **On-screen vote menu** — optional screen-space menu (options + running tallies) rendered with layered `point_worldtext` entities glued to your camera — reimplemented in-house from the screen-menu technique with zero dependencies and no client files. **Hold your voice-commands key (default Z)** to use it: the game's own cursor appears, movement freezes, W/S moves the highlight, E casts the vote, and your weapon can't fire. Close the wheel and you're instantly back in the game. Round-based votes flash the menu for 10s at each round end and at the vote's conclusion; timed votes keep it up all vote with a countdown.
 - **CounterStrikeSharp admin support** — vote admin access via `@css/generic` / `@css/root`; the manual SteamID list still works.
 - **Recent-map exclusion** — the last `recent_maps_count` played maps are kept out of votes entirely: the random pool *and* nominations. Works for workshop and stock maps alike.
 - **Self-documenting config** — `CS2SimpleVote.json` is generated sectioned by feature with instructions above every setting, plus a pristine `CS2SimpleVote.example.json` for reference. Edits apply on the next map change, no restart.
@@ -173,10 +173,10 @@ Vote for the Next Map!
 2. Mirage  (1)
 0. Extend Current Map  (0)    ← when enable_extend_vote is on
 
-Hold SHIFT to use this menu, or type the number in chat
+Hold your voice-commands key (Z) to use this menu, or type the number in chat
 ```
 
-**Using it**: **hold SHIFT** — movement freezes (your view stays free), your weapon can't fire, and **W/S** moves the selection while **E or LMB** casts (or changes) your vote. Release SHIFT and control returns instantly. Typing the option number in chat always works too. During a round-based vote, holding SHIFT also summons the menu outside its 10-second flash windows.
+**Using it**: **hold your voice-commands key** (default **Z** — the radial voice wheel) — the game's own mouse cursor appears and your mouse stops turning your view, movement freezes, and your weapon can't fire. **W/S** moves the selection and **E** casts (or changes) your vote; close the wheel and control returns instantly. Typing the option number in chat always works too. During a round-based vote, holding the key also summons the menu outside its 10-second flash windows.
 
 - **Round-based votes**: the menu is not up the whole vote — it appears for **10 seconds at the end of every round** the vote is open, and for **10 seconds at the vote's conclusion** (final tally with the winner highlighted).
 - **Timed votes** (and all RTV votes): the menu stays up for the **entire vote** with a live countdown, then shows the 10-second conclusion.
