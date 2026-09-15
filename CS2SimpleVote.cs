@@ -117,7 +117,7 @@ public class TrackedMapEntry
 public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 {
     public override string ModuleName => "CS2SimpleVote";
-    public override string ModuleVersion => "1.9.2";
+    public override string ModuleVersion => "1.10.0";
 
     private const string ColorDefault = "\x01";
     private const string ColorGreen = "\x04";
@@ -154,9 +154,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     private readonly Dictionary<int, string> _activeVoteOptions = new();
     private readonly Dictionary<int, int> _playerVotes = new();
 
-    // Vote option key 0 maps to this sentinel when enable_extend_vote is on. Winning
+    // The last vote option maps to this sentinel when enable_extend_vote is on. Winning
     // it sets the next map to the current map. Never a real workshop ID or map name.
     private const string ExtendOptionId = "@extend";
+
+    // Players who chatted "0" to hide the vote panel for the current vote.
+    private readonly HashSet<int> _hudHiddenPlayers = new();
 
 
     // State: vote timing / center HUD.
@@ -484,17 +487,17 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 new[]
                 {
                     E("enable_extend_vote", c.EnableExtendVote,
-                        "Adds `[0] Extend Current Map` to every vote (players type `0` or `!0`). If it wins, the next map is the current one, replayed after this match."),
+                        "Adds `Extend Current Map` as the last option of every vote. If it wins, the next map is the current one, replayed after this match."),
                     E("vote_options_count", c.VoteOptionsCount,
                         "How many maps are offered per vote (clamped to 2-10)."),
                 }),
 
             new("Vote HUD",
-                "A display-only panel in the centre of the screen: a yellow \"type a number to vote\" header - carrying, on timed votes, a countdown that shifts green to yellow to red as time runs out - followed by each numbered option with its live tally. Players still vote by typing the number in chat.",
+                "A display-only panel in the centre of the screen: a yellow \"chat a number to vote\" header - carrying, on timed votes, a countdown that shifts green to yellow to red as time runs out - followed by each numbered option with its live tally and a `0: Show/Hide` row. Players still vote by chatting the number; chatting `0` hides the panel (and shows it again).",
                 new[]
                 {
                     E("enable_vote_hud", c.EnableVoteHud,
-                        "Show the panel. While enabled it replaces the plain `VOTE NOW!` prompt, the chat option list, and chat vote reminders. It is shown for the whole vote and hidden the moment the vote ends."),
+                        "Show the panel. While enabled it replaces the plain `VOTE NOW!` prompt, the chat option list, and chat vote reminders. It is shown for the whole vote and hidden the moment the vote ends; any player can chat `0` to hide it for themselves and `0` again to bring it back."),
                     E("hud_font_file", c.HudFontFile,
                         "Font used to compute the panel's column alignment. Leave empty to auto-detect the game's own font under `csgo/panorama/fonts` (encrypted `.uifont` packages are unwrapped automatically); set a filename or full path to override. The console logs which font was measured at load."),
                 }),
@@ -1074,6 +1077,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _voteTotalSeconds = 0f;
         _voteCenterHtmlCache = "";
         _hudScrollTick = 0;
+        _hudHiddenPlayers.Clear();
 
         _rtvVoters.Clear();
         _playerVotes.Clear();
@@ -2238,7 +2242,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (Config.EnableVoteHud)
         {
             // The panel is already on screen — no need to spam the list into chat.
-            player!.PrintToChat($" {ColorDefault}The options are on your screen — type the {ColorGreen}number{ColorDefault} in chat to recast your vote.");
+            _hudHiddenPlayers.Remove(player!.Slot); // !revote brings a hidden panel back
+            player.PrintToChat($" {ColorDefault}The options are on your screen — chat the {ColorGreen}number{ColorDefault} to recast your vote.");
             return;
         }
         player!.PrintToChat($" {ColorDefault}Redisplaying vote options. You may recast your vote.");
@@ -2550,7 +2555,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         if (!IsValidPlayer(player)) return;
         var p = player!;
         if (!Config.EnableNominate) { p.PrintToChat($" {ColorDefault}Nominations are currently disabled."); return; }
-        if (_voteInProgress) { p.PrintToChat($" {ColorDefault}A map vote is in progress — type the {ColorGreen}number{ColorDefault} in chat to vote!"); return; }
+        if (_voteInProgress) { p.PrintToChat($" {ColorDefault}A map vote is in progress — chat the {ColorGreen}number{ColorDefault} to vote!"); return; }
         if (_voteFinished) { p.PrintToChat($" {ColorDefault}Voting has already finished — the next map is decided."); return; }
         
         bool isRenomination = _hasNominatedSteamIds.Contains(p.SteamID);
@@ -3416,6 +3421,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         _currentVoteRoundDuration = 0;
         _hudScrollTick = 0; // every vote's marquee starts at the names' beginnings
         _playerVotes.Clear(); _activeVoteOptions.Clear(); _nominatingPlayers.Clear(); _playerNominationPage.Clear(); _helpMenuPlayers.Clear();
+        _hudHiddenPlayers.Clear(); // every vote starts with the panel visible to everyone
 
         // Nominations are re-checked against the freshly rebuilt pool AND the
         // recent-map list here, in case a map was disabled (file edit or !omitmap)
@@ -3458,10 +3464,11 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             return;
         }
 
-        // The extend option occupies key 0 so "0" / "!0" casts it. Only offered when
-        // there is at least one real map option (an extend-only vote is pointless).
+        // The extend option takes the slot after the last map ("0" is reserved for
+        // hiding the panel). Only offered when there is at least one real map option
+        // (an extend-only vote is pointless).
         if (Config.EnableExtendVote)
-            _activeVoteOptions[0] = ExtendOptionId;
+            _activeVoteOptions[mapsToVote.Count + 1] = ExtendOptionId;
 
         Server.PrintToChatAll($" {ColorDefault}--- {ColorGreen}Vote for the Next Map! {ColorDefault}---");
 
@@ -3484,7 +3491,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         }
 
         // The center panel replaces the chat option list entirely while enabled;
-        // players still vote by typing the number in chat.
+        // players still vote by chatting the number.
         if (Config.EnableVoteHud)
             RefreshVotePanel(force: true);
         else
@@ -3527,6 +3534,24 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
 
     private HookResult HandleVoteInput(CCSPlayerController player, string input)
     {
+        // "0" toggles the panel for this player only. It is a no-op (plain chat)
+        // whenever the panel isn't on — never an error message.
+        if (input == "0")
+        {
+            if (!Config.EnableVoteHud) return HookResult.Continue;
+            if (_hudHiddenPlayers.Remove(player.Slot))
+            {
+                player.PrintToChat($" {ColorDefault}Vote panel {ColorGreen}shown{ColorDefault}. Chat {ColorGreen}0{ColorDefault} to hide it again.");
+            }
+            else
+            {
+                _hudHiddenPlayers.Add(player.Slot);
+                try { player.PrintToCenterHtml(" "); } catch { }
+                player.PrintToChat($" {ColorDefault}Vote panel {ColorRed}hidden{ColorDefault}. Chat {ColorGreen}0{ColorDefault} to show it again — you can still vote by chatting a {ColorGreen}number{ColorDefault}.");
+            }
+            return HookResult.Handled;
+        }
+
         if (int.TryParse(input, out int option) && _activeVoteOptions.ContainsKey(option))
         {
             _playerVotes[player.Slot] = option;
@@ -3673,12 +3698,12 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     }
 
     private void PrintVoteOptionsToAll() { foreach (var p in GetHumanPlayers()) PrintVoteOptionsToPlayer(p); }
-    private void PrintVoteOptionsToPlayer(CCSPlayerController player) { player.PrintToChat($" {ColorDefault}Type the {ColorGreen}number{ColorDefault} to vote:"); foreach (var kvp in OrderedVoteOptions()) player.PrintToChat($" {ColorGreen}[{kvp.Key}] {ColorDefault}{OptionName(kvp.Value)}"); }
+    private void PrintVoteOptionsToPlayer(CCSPlayerController player) { player.PrintToChat($" {ColorDefault}Chat the {ColorGreen}number{ColorDefault} to vote:"); foreach (var kvp in OrderedVoteOptions()) player.PrintToChat($" {ColorGreen}[{kvp.Key}] {ColorDefault}{OptionName(kvp.Value)}"); }
 
-    // Map options first (1..N), the extend option (key 0) last — matching the order
+    // Map options first (1..N), the extend option (key N+1) last — matching the order
     // players see everywhere (chat list, HUD, tallies).
     private IEnumerable<KeyValuePair<int, string>> OrderedVoteOptions()
-        => _activeVoteOptions.OrderBy(kv => kv.Key == 0 ? int.MaxValue : kv.Key);
+        => _activeVoteOptions.OrderBy(kv => kv.Key);
 
     // Display name for a vote option id (handles the extend sentinel).
     private string OptionName(string optionId)
@@ -3703,8 +3728,10 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
     // no dependency, no entities, no input of its own. A yellow header telling
     // players to vote in chat — carrying, for timed votes, an inline countdown
     // that goes green -> yellow -> red as time runs out — followed by the
-    // numbered options with live tallies. The panel deliberately ends on the last
-    // option: any trailing row would sit on top of the chat messages below it.
+    // numbered options with live tallies and a dim "0: Show/Hide" row. Chatting
+    // 0 hides the panel for that player (and shows it again); the tick simply
+    // skips hidden players. The panel deliberately ends on that last row: any
+    // further row would sit on top of the chat messages below it.
     // While the panel is on, the chat option list is suppressed.
     //
     // Transport: the cached html is re-sent EVERY TICK — exactly what CSS core's
@@ -4156,7 +4183,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         // no padding, so nothing of it can be trimmed. The timed-vote countdown is
         // appended inline here rather than as its own footer row — an extra row at
         // the bottom of the panel covers the chat messages underneath it.
-        sb.Append("<font color='#FFD700'><b>Type a number to vote");
+        sb.Append("<font color='#FFD700'><b>Chat a number to vote");
         if (_voteIsTimed)
         {
             int remaining = VoteSecondsRemaining();
@@ -4188,6 +4215,16 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             sb.Append($" <font color='#B0B0B0'>({votes})</font>");
         }
 
+        // Shaped like an option row (number, label, pad, trailing glyph) so its "0:"
+        // sits in the number column and the pad is never at the end of the line.
+        const string hideLabel = "Show/Hide";
+        const string hideTail = " •";
+        float hideUsed = EstimateHudWidth("0: ") + EstimateHudWidth(hideLabel) + EstimateHudWidth(hideTail);
+        int hidePad = Math.Max(0, (int)Math.Round((HudMaxLineUnits - hideUsed) / PadUnits));
+        sb.Append($"<br><font color='#FF5722'>0:</font> <font color='#9E9E9E'>{hideLabel}</font>");
+        sb.Append(PadChar, hidePad);
+        sb.Append($"<font color='#6E6E6E'>{hideTail}</font>");
+
         return sb.ToString();
     }
 
@@ -4205,7 +4242,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         try
         {
             foreach (var p in GetHumanPlayers())
-                p.PrintToCenterHtml(_voteCenterHtmlCache);
+                if (!_hudHiddenPlayers.Contains(p.Slot))
+                    p.PrintToCenterHtml(_voteCenterHtmlCache);
         }
         catch { /* never let a render error hit the tick */ }
     }
@@ -4356,6 +4394,7 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
         {
             _rtvVoters.Remove(player.Slot);
             _playerVotes.Remove(player.Slot);
+            _hudHiddenPlayers.Remove(player.Slot);
             CloseNominationMenu(player);
             CloseForcemapMenu(player);
             CloseSetNextMapMenu(player);
