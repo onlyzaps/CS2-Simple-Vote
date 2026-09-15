@@ -5,6 +5,7 @@ A lightweight, Workshop-collection–driven map voting plugin for Counter-Strike
 <p align="left">
   <img alt="version" src="https://img.shields.io/badge/version-1.7.8-blue">
   <img alt="platform" src="https://img.shields.io/badge/CS2-CounterStrikeSharp-orange">
+  https://buymeacoffee.com/theboneman
 </p>
 
 ---
