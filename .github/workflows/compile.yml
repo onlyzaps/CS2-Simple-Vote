@@ -21,13 +21,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Bump Version and Create Tag
-        id: tag_version
-        uses: mathieudutour/github-tag-action@v6.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: patch
-
       - name: Setup .NET 10.0
         uses: actions/setup-dotnet@v4
         with:
@@ -45,6 +38,15 @@ jobs:
           mv ./publish_temp/${{ env.PLUGIN_NAME }}.dll ./release_stage/addons/counterstrikesharp/plugins/${{ env.PLUGIN_NAME }}/
           mv ./publish_temp/${{ env.PLUGIN_NAME }}.pdb ./release_stage/addons/counterstrikesharp/plugins/${{ env.PLUGIN_NAME }}/
           mv ./publish_temp/${{ env.PLUGIN_NAME }}*.json ./release_stage/addons/counterstrikesharp/plugins/${{ env.PLUGIN_NAME }}/
+
+      # Tagging runs only after the build and staging have succeeded, so a failed
+      # run leaves no orphan tag behind to clean up before the next attempt.
+      - name: Bump Version and Create Tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
 
       - name: Zip Release Artifact
         run: |
