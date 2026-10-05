@@ -169,6 +169,7 @@ RTV votes are always timed (30 seconds) regardless of this setting.
 | Key | Default | Description |
 |---|---|---|
 | `enable_vote_hud` | `false` | Center vote panel; replaces the `VOTE NOW!` prompt and suppresses chat reminders |
+| `hide_hud_after_vote` | `false` | Hide the panel for a player once they vote; a chat message tells them to chat `0` to bring it back and follow the voting progress |
 
 A display-only panel in the center of the screen, styled like [CS2MenuManager](https://github.com/schwarper/CS2MenuManager)'s CenterHtmlMenu but implemented in-house with the native `PrintToCenterHtml` — **no dependency, no entities, no keys to learn**:
 

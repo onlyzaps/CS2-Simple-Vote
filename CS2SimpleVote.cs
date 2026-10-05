@@ -54,6 +54,7 @@ public class VoteConfig : BasePluginConfig
     // Vote HUD (display-only center panel with options + live tallies; replaces
     // VOTE NOW! and suppresses chat reminders while enabled)
     [JsonPropertyName("enable_vote_hud")] public bool EnableVoteHud { get; set; } = false;
+    [JsonPropertyName("hide_hud_after_vote")] public bool HideHudAfterVote { get; set; } = false;
     [JsonPropertyName("hud_font_file")] public string HudFontFile { get; set; } = "";
 
     // Vote Reminders
@@ -498,6 +499,8 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
                 {
                     E("enable_vote_hud", c.EnableVoteHud,
                         "Show the panel. While enabled it replaces the plain `VOTE NOW!` prompt, the chat option list, and chat vote reminders. It is shown for the whole vote and hidden the moment the vote ends; any player can chat `0` to hide it for themselves and `0` again to bring it back."),
+                    E("hide_hud_after_vote", c.HideHudAfterVote,
+                        "Hide the panel for a player as soon as they cast their vote, with a chat message telling them to chat `0` to bring it back and follow the voting progress. Players who chat `0` to show it again keep it for the rest of the vote. Does nothing unless `enable_vote_hud` is on."),
                     E("hud_font_file", c.HudFontFile,
                         "Font used to compute the panel's column alignment. Leave empty to auto-detect the game's own font under `csgo/panorama/fonts` (encrypted `.uifont` packages are unwrapped automatically); set a filename or full path to override. The console logs which font was measured at load."),
                 }),
@@ -3559,6 +3562,14 @@ public class CS2SimpleVote : BasePlugin, IPluginConfig<VoteConfig>
             string votedMapName = OptionName(votedMapId);
             Log("VOTE", $"{PlayerTag(player)} voted for option {option}: {votedMapName} ({votedMapId})");
             player.PrintToChat($" {ColorDefault}You voted for: {ColorGreen}{votedMapName}{ColorDefault}");
+            // hide_hud_after_vote: the player has done their part, so drop the panel
+            // for them. Add() is false when it is already hidden (a recast vote), so
+            // the message is only printed the first time.
+            if (Config.EnableVoteHud && Config.HideHudAfterVote && _hudHiddenPlayers.Add(player.Slot))
+            {
+                try { player.PrintToCenterHtml(" "); } catch { }
+                player.PrintToChat($" {ColorDefault}Vote panel {ColorRed}hidden{ColorDefault}. Chat {ColorGreen}0{ColorDefault} to show it again and follow the voting progress.");
+            }
             // Tallies changed — refresh the panel right away instead of waiting
             // for the next 0.5s tick.
             RefreshVotePanel();
